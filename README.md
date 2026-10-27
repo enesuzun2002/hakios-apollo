@@ -138,10 +138,11 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 ## Devices
 
 The kernel, loader and user space are shared. Everything about one phone lives in
-`devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
-`devices/poco-x5-pro/`, and its README is the map of what a port to another Qualcomm phone must bring.
+`devices/<name>/`: its UEFI, device tree, firmware list and tools. `devices/poco-x5-pro/` is the
+first, and its README is the map of what a port to another Qualcomm phone must bring.
 The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
-numbers came from.
+numbers came from. `devices/mi-10t/` is the Xiaomi Mi 10T (SM8250), whose drivers and hooks are its
+own kernel overlay (`devices/mi-10t/xnu/`, applied by `xnu/apply.sh`); its README says how to run it.
 
 ## Cellular
 
