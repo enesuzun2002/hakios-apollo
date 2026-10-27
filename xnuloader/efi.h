@@ -16,6 +16,7 @@ typedef uint16_t char16;
 
 #define EFI_ERROR_BIT        0x8000000000000000ULL
 #define EFI_ERROR(s)         (((s) & EFI_ERROR_BIT) != 0)
+#define EFI_UNSUPPORTED      (EFI_ERROR_BIT | 3)
 #define EFI_BUFFER_TOO_SMALL (EFI_ERROR_BIT | 5)
 
 typedef struct {
@@ -237,7 +238,8 @@ typedef struct {
 
 typedef struct {
 	uint64_t revision;
-	void *start;
+	efi_status (EFIAPI *start)(void *device_descriptor, void **descriptors, void *device_qualifier,
+	    void *bos, uint8_t string_count, void **strings);
 	efi_status (*send)(uint8_t endpoint, uint64_t size, void *buffer);
 	efi_status (EFIAPI *handle_event)(uint32_t *event, uint64_t *size, usb_device_event_data *data);
 	efi_status (EFIAPI *allocate_transfer_buffer)(uint64_t size, void **buffer);

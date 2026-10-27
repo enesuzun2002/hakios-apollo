@@ -551,6 +551,9 @@ static const struct platform platform_redwood = {
 	.small_cores = 0x0f,
 };
 
+/* the other phones, each from its own directory */
+#include "../devices/mi-10t/xnuloader/platform.h"
+
 /* ------------------------------------------------------------------------ */
 
 static void
@@ -921,6 +924,16 @@ static struct loader_battery charger_shared __attribute__((aligned(0x2000))) = {
 static efi_charger_ex *CHARGER_EX;
 static efi_qcom_charger *QCOM_CHARGER;
 static int charger_enabled;
+/*
+ * "apollo_charge=1" among the kernel's arguments (the Mi 10T only): the loader does what Qualcomm's charger app does in
+ * its loop, as found by disassembling the phone's QcomChargerApp.efi and QcomChargerDxeLA.efi: it asks
+ * GetChargingAction (mode 1) and hands the answer to TakeAction -- but only for the three answers that keep a phone
+ * charging: 7 (load the battery profile: the charge parameters), 1 (start charging), 0 (continue: also pets the
+ * charger's watchdog). Never anything else: 4, 5 and 8 shut the phone down, 6 and 10 stop charging or shut down, 2
+ * stops, 3 ends the charger's session. The firmware's own limits (temperature, JEITA) stay in force.
+ */
+static int charge_requested;
+static uint32_t charge_taken[3], charge_last_action = 0xffffffffu;
 
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;
@@ -1074,7 +1087,21 @@ charger_poll(void)
 		}
 	}
 	if (QCOM_CHARGER != NULL) {
-		s = QCOM_CHARGER->get_charging_action(&action, &status, 0);
+		s = QCOM_CHARGER->get_charging_action(&action, &status, charge_requested ? 1 : 0);
+		if (!EFI_ERROR(s) && charge_requested && PLAT == &platform_apollo && (action == 7 || action == 1 || action == 0)) {
+			efi_status t = QCOM_CHARGER->take_action(action, &status);
+
+			charge_taken[action == 7 ? 2 : action]++;
+			if (action != charge_last_action) {
+				print("battery: charging action %d taken (%x); taken so far: continue %d, start %d, profile %d\n",
+				    (uint64_t)action, t, (uint64_t)charge_taken[0], (uint64_t)charge_taken[1], (uint64_t)charge_taken[2]);
+			}
+		} else if (!EFI_ERROR(s) && charge_requested && action != charge_last_action) {
+			print("battery: charging action %d: not one this loader takes; left to the firmware\n", (uint64_t)action);
+		}
+		if (!EFI_ERROR(s)) {
+			charge_last_action = action;
+		}
 		if (!EFI_ERROR(s)) {
 			charger_shared.charger_action = action;
 			if (status.battery_voltage_mv >= 2500 && status.battery_voltage_mv <= 5000) {
@@ -2166,7 +2193,8 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	/* the POCO's and the Mi 10T's UEFIs both carry Qualcomm's charger drivers */
+	if (charger_enabled || (PLAT != &platform_redwood && PLAT != &platform_apollo)) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -2847,6 +2875,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
 	 * loader asked for (the loader stays resident across runs) */
 	block_write_requested = 0;
+	charge_requested = 0;          /* (as the writes: this run's arguments say) */
 	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
@@ -2855,6 +2884,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
+		/* (the Mi 10T's own battery driver, devices/mi-10t/xnu: hakios.apollo_battery.c, reads the same page) */
+		battery_requested |= starts_with(c, "apollo_battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[16] == 0 || c[16] == ' ');
+		charge_requested |= starts_with(c, "apollo_charge=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[15] == 0 || c[15] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
@@ -3007,6 +3041,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
 		}
 		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+	}
+	/* which phone this is, for a phone with its own drivers (devices/<name>/xnu): they start only on it */
+	if (PLAT == &platform_apollo) {
+		for (const char *c = "device=apollo "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
 	}
 	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
@@ -3476,10 +3516,29 @@ usb_start(void)
 	set.bos = usb_bos;
 	set.string_count = 5;
 	set.strings = strings;
-	efi_status s = USB->start_ex(&set);
+	efi_status s = EFI_UNSUPPORTED;
+	int tried_superspeed = USB->start_ex != NULL;
+	if (tried_superspeed) {
+		s = USB->start_ex(&set);
+	}
 	if (EFI_ERROR(s)) {
-		print("usb: start failed %x\n", s);
-		return 0;
+		print("usb: superspeed start %s (%x); trying USB2\n",
+		    tried_superspeed ? "failed" : "unavailable", s);
+		/* Some Qualcomm UEFI builds (the Mi 10T's) expose the extended method but only wire
+		 * up the legacy USB2 gadget path. Drop any partial SS state first. */
+		if (tried_superspeed && USB->stop != NULL) {
+			USB->stop();
+		}
+		if (USB->start == NULL) {
+			print("usb: no USB2 start method\n");
+			return 0;
+		}
+		s = USB->start((void *)usb_dev_desc, (void **)&cfg,
+		    (void *)usb_qualifier, NULL, 5, (void **)strings);
+		if (EFI_ERROR(s)) {
+			print("usb: USB2 start failed %x\n", s);
+			return 0;
+		}
 	}
 	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
 	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
@@ -3932,6 +3991,8 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.width == APOLLO_SCREEN_WIDTH && SCREEN.height == APOLLO_SCREEN_HEIGHT) {
+			PLAT = &platform_apollo;        /* its base is the firmware's choice (devices/mi-10t/xnuloader) */
 		} else {
 			ramfb_phone_screen();
 		}
