@@ -6,8 +6,10 @@ usage: fetch-from-ipsw.py MEMBER OUTPUT
 The IPSW is a ZIP64 archive on Apple's CDN; its directory is read with HTTP range requests and
 the member is streamed (and inflated, if it is compressed) straight to OUTPUT. A download that
 breaks off is taken up again: a member stored without compression (the big disk images are)
-continues where it stopped, also when OUTPUT is the partial file of an earlier run; a compressed
-one starts over.
+continues where it stopped, also when OUTPUT is the partial file of an earlier run (OUTPUT.member says
+which member it is a part of: one of another member, or of another archive, is started over); a compressed
+one starts over. Every member is checked against the CRC-32 of the archive's directory once it is whole,
+and one that does not match is fetched again from the start.
 """
 import http.client
 import os
@@ -36,7 +38,7 @@ def directory():
     p = 0
     while cd[p:p + 4] == b'PK\x01\x02':
         method, = struct.unpack('<H', cd[p + 10:p + 12])
-        csize, usize, nl, el, cl = struct.unpack('<IIHHH', cd[p + 20:p + 34])
+        crc, csize, usize, nl, el, cl = struct.unpack('<IIIHHH', cd[p + 16:p + 34])
         offset, = struct.unpack('<I', cd[p + 42:p + 46])
         name = cd[p + 46:p + 46 + nl].decode()
         extra = cd[p + 46 + nl:p + 46 + nl + el]
@@ -52,16 +54,32 @@ def directory():
                 if offset == 0xFFFFFFFF:
                     offset = values.pop(0)
             q += 4 + length
-        yield name, method, csize, usize, offset
+        yield name, method, csize, usize, offset, crc
         p += 46 + nl + el + cl
 
 
-def download(data, method, csize, output):
+def file_crc(path):
+    crc = 0
+    with open(path, 'rb') as f:
+        while chunk := f.read(1 << 20):
+            crc = zlib.crc32(chunk, crc)
+    return crc
+
+
+def download(data, method, csize, output, ident):
     """One attempt at the member whose bytes start at DATA in the archive; returns the size of OUTPUT."""
     if method == 0:
+        marker = output + '.member'
         have = os.path.getsize(output) if os.path.exists(output) else 0
         if have > csize:
             have = 0
+        if have and os.path.exists(marker):
+            with open(marker) as f:
+                if f.read() != ident:
+                    print(f'{output}: the partial file is of another member; starting over', file=sys.stderr)
+                    have = 0
+        with open(marker, 'w') as f:
+            f.write(ident)
         if have < csize:
             with fetch(data + have, data + csize - 1) as stream, open(output, 'ab' if have else 'wb') as out:
                 while chunk := stream.read(1 << 20):
@@ -82,10 +100,10 @@ def download(data, method, csize, output):
 def main():
     member, output = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else ''
     if member == '--list':
-        for n, m, c, u, o in directory():
+        for n, m, c, u, o, crc in directory():
             print(u, c, m, n)
         return
-    for name, method, csize, usize, offset in directory():
+    for name, method, csize, usize, offset, crc in directory():
         if name != member:
             continue
         if method not in (0, 8):
@@ -93,18 +111,28 @@ def main():
         header = fetch(offset, offset + 29).read()
         nl, el = struct.unpack('<HH', header[26:30])
         data = offset + 30 + nl + el
-        written = -1
+        ident = f'{URL} {member} {offset} {csize} {crc:08x}\n'
+        written, good = -1, False
         for attempt in range(1, ATTEMPTS + 1):
+            written = -1
             try:
-                written = download(data, method, csize, output)
+                written = download(data, method, csize, output, ident)
             except (OSError, http.client.HTTPException, zlib.error) as error:
                 print(f'{member}: {error}', file=sys.stderr)
             if written == usize:
-                break
-            print(f'{member}: the download broke off, trying again ({attempt} of {ATTEMPTS})', file=sys.stderr)
+                if file_crc(output) == crc:
+                    good = True
+                    break
+                # (a partial file of an earlier run that was not this member's, or bytes that came wrong)
+                print(f'{member}: CRC-32 does not match the archive\'s {crc:08x}; starting over', file=sys.stderr)
+                os.remove(output)
+            else:
+                print(f'{member}: the download broke off, trying again ({attempt} of {ATTEMPTS})', file=sys.stderr)
             time.sleep(5)
-        print(f'{member}: {written} bytes (expected {usize})')
-        sys.exit(0 if written == usize else 1)
+        if good and os.path.exists(output + '.member'):
+            os.remove(output + '.member')
+        print(f'{member}: {written} bytes (expected {usize}){"" if good else ", CRC-32 not verified"}')
+        sys.exit(0 if good else 1)
     sys.exit(f'{member}: not in the archive')
 
 

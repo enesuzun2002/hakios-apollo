@@ -43,6 +43,19 @@ unzbm_all() { # unzbm_all DIR: expand every LZBITMAP file below DIR (7z leaves t
 	[ "$left" = 0 ] || { echo "build-system.sh: $left files in $1 are still compressed"; exit 1; }
 }
 
+extract() { # extract LOG 7Z-ARGUMENTS...: 7z x into LOG; stops the build on any failure but the expected ones
+	local status=0
+	7z x -y "${@:2}" > "$1" 2>&1 || status=$?
+	# 7z never exits 0 on these images: 1 for its warning that the .dmg is not a [Dmg] archive (it is opened as
+	# APFS), 2 for every LZBITMAP file ("ERROR: Unsupported Method : PATH": left empty, unzbm_all expands it).
+	# Those are benign; any other error (a data or CRC error, a full disk, an archive it cannot open) is not.
+	if [ $status -gt 2 ] || grep '^ERROR: ' "$1" | grep -qv '^ERROR: Unsupported Method : '; then
+		echo "build-system.sh: 7z x ${*:2} failed (exit $status); see $DATA/$1:"
+		grep '^ERROR: ' "$1" | grep -v '^ERROR: Unsupported Method : ' | head -5
+		exit 1
+	fi
+}
+
 if [ $STEP = extract ] || [ $STEP = all ]; then
 	# --- the root filesystem: what select-system.py chooses ---------------------------------------
 	if [ ! -f rootfs.slt ]; then
@@ -53,7 +66,7 @@ if [ $STEP = extract ] || [ $STEP = all ]; then
 	if [ ! -f .done-rootfs ] || [ "$HERE/select-system.py" -nt .done-rootfs ]; then
 		echo "build-system.sh: extracting $(wc -l < system.files) files of the root filesystem"
 		rm -rf rootfs
-		7z x -y -orootfs dec/rootfs.dmg @system.files > extract-system.log 2>&1 || true
+		extract extract-system.log -orootfs dec/rootfs.dmg @system.files
 		unzbm_all rootfs
 		touch .done-rootfs
 	fi
@@ -61,8 +74,8 @@ if [ $STEP = extract ] || [ $STEP = all ]; then
 	if [ ! -f .done-cryptex ]; then
 		echo "build-system.sh: extracting the SystemOS cryptex"
 		rm -rf cryptex
-		# 7z reports every LZBITMAP file as "Unsupported method": expected, unzbm_all checks the result
-		7z x -y -ocryptex dec/cryptex-os.dmg '-xr!com.apple.dyld' '-x!System/DriverKit' > extract-cryptex.log 2>&1 || true
+		# 7z reports every LZBITMAP file as "Unsupported method": expected (extract), unzbm_all checks the result
+		extract extract-cryptex.log -ocryptex '-xr!com.apple.dyld' '-x!System/DriverKit' dec/cryptex-os.dmg
 		unzbm_all cryptex
 		[ -d cryptex/System/Library/PrivateFrameworks ] || { echo "build-system.sh: the SystemOS cryptex is incomplete"; exit 1; }
 		touch .done-cryptex
@@ -71,7 +84,7 @@ if [ $STEP = extract ] || [ $STEP = all ]; then
 	if [ ! -f .done-cryptex-app ]; then
 		echo "build-system.sh: extracting the AppOS cryptex"
 		rm -rf cryptex-app
-		7z x -y -ocryptex-app cryptex-app.dmg > extract-cryptex-app.log 2>&1 || true
+		extract extract-cryptex-app.log -ocryptex-app cryptex-app.dmg
 		unzbm_all cryptex-app
 		[ -n "$(ls cryptex-app)" ] || { echo "build-system.sh: the AppOS cryptex is empty"; exit 1; }
 		touch .done-cryptex-app
@@ -93,8 +106,10 @@ if [ $STEP = image ] || [ $STEP = all ]; then
 	# the applications iOS installs on its first boot are system applications here (see select-system.py)
 	if [ -d sysroot/private/var/staged_system_apps ]; then
 		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
-		rm -rf sysroot/private/var
 	fi
+	# /private/var stays an empty directory, whether or not there were staged applications: init puts a ramfs
+	# on it, and select-system.py keeps in the manifest only private/var itself (mkapfs.py makes it from that)
+	rm -rf sysroot/private/var
 	if [ -z "$NO_STAGE0" ]; then
 		[ -f "$STAGE0" ] || { echo "build-system.sh: $STAGE0 not found (build userland first, or NO_STAGE0=1)"; exit 1; }
 		mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
