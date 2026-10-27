@@ -24,6 +24,7 @@ apollo_input_init(void)
 	apollo_touch_init();
 	apollo_buttons_init();
 	apollo_battery_init();
+	apollo_haptic_init();            /* apollo_haptic=N: the AW8697 vibration motor, /dev/apollo-haptic */
 	apollo_audio_init();             /* /dev/apollo-audio, for iOS's audio plug-in */
 	apollo_adsp_init();              /* apollo_audio=N: the audio DSP, and from it the speakers */
 }

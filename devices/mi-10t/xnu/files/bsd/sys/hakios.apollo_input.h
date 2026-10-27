@@ -32,6 +32,8 @@ void apollo_backlight_init(void);       /* apollo_backlight=P: the panel's light
 void apollo_backlight_set(uint32_t fraction);   /* iOS's brightness, 0 to 0x10000 */
 void apollo_backlight_power(bool on);   /* the display switched off or on */
 void apollo_backlight_stop(void);       /* the run ends: the light as the firmware had it */
+void apollo_haptic_init(void);  /* apollo_haptic=N: the vibration motor, an Awinic AW8697 (bsd/dev/hakios.apollo_haptic.c) */
+void apollo_haptic_quiesce(void);       /* the run ends or a panic's way back: the chip into reset, no lock, no sleep */
 void apollo_adreno_init(void);  /* apollo_gpu=N: the Adreno 650, steps 1 to N (bsd/dev/hakios.apollo_adreno.c) */
 
 /*
