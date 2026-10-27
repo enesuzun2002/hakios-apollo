@@ -1150,8 +1150,11 @@ charger_poll(void)
 		}
 	}
 	if (QCOM_CHARGER != NULL) {
-		s = QCOM_CHARGER->get_charging_action(&action, &status, charge_requested ? 1 : 0);
-		if (!EFI_ERROR(s) && charge_requested && PLAT == &platform_apollo && (action == 7 || action == 1 || action == 0)) {
+		/* (apollo_charge=1 is the Mi 10T's only: on any other phone the mode stays 0, as it always was) */
+		int charging = charge_requested && PLAT == &platform_apollo;
+
+		s = QCOM_CHARGER->get_charging_action(&action, &status, charging ? 1 : 0);
+		if (!EFI_ERROR(s) && charging && (action == 7 || action == 1 || action == 0)) {
 			efi_status t = QCOM_CHARGER->take_action(action, &status);
 
 			charge_taken[action == 7 ? 2 : action]++;
@@ -1159,7 +1162,7 @@ charger_poll(void)
 				print("battery: charging action %d taken (%x); taken so far: continue %d, start %d, profile %d\n",
 				    (uint64_t)action, t, (uint64_t)charge_taken[0], (uint64_t)charge_taken[1], (uint64_t)charge_taken[2]);
 			}
-		} else if (!EFI_ERROR(s) && charge_requested && action != charge_last_action) {
+		} else if (!EFI_ERROR(s) && charging && action != charge_last_action) {
 			print("battery: charging action %d: not one this loader takes; left to the firmware\n", (uint64_t)action);
 		}
 		if (!EFI_ERROR(s)) {
@@ -2956,7 +2959,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
-		identity_11pro |= starts_with(c, "identity=iphone12,3") && (c == pi.cmdline || c[-1] == ' ');
+		identity_11pro |= starts_with(c, "identity=iphone12,3") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[19] == 0 || c[19] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
 			ufs_requested = c[4] - '0';
@@ -3582,15 +3586,20 @@ usb_start(void)
 	set.string_count = 5;
 	set.strings = strings;
 	efi_status s = EFI_UNSUPPORTED;
-	int tried_superspeed = USB->start_ex != NULL;
+	int tried_superspeed = PLAT != &platform_apollo || USB->start_ex != NULL;
 	if (tried_superspeed) {
 		s = USB->start_ex(&set);
+	}
+	if (EFI_ERROR(s) && PLAT != &platform_apollo) {
+		print("usb: start failed %x\n", s);
+		return 0;
 	}
 	if (EFI_ERROR(s)) {
 		print("usb: superspeed start %s (%x); trying USB2\n",
 		    tried_superspeed ? "failed" : "unavailable", s);
-		/* Some Qualcomm UEFI builds (the Mi 10T's) expose the extended method but only wire
-		 * up the legacy USB2 gadget path. Drop any partial SS state first. */
+		/* The Mi 10T only (any other phone stops above, as it always did): its Qualcomm UEFI
+		 * exposes the extended method but only wires up the legacy USB2 gadget path. Drop any
+		 * partial SS state first. */
 		if (tried_superspeed && USB->stop != NULL) {
 			USB->stop();
 		}
@@ -4056,8 +4065,9 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
-		} else if (SCREEN.width == APOLLO_SCREEN_WIDTH && SCREEN.height == APOLLO_SCREEN_HEIGHT) {
-			PLAT = &platform_apollo;        /* its base is the firmware's choice (devices/mi-10t/xnuloader) */
+		} else if (SCREEN.base == APOLLO_SCREEN_BASE && SCREEN.width == APOLLO_SCREEN_WIDTH &&
+		    SCREEN.height == APOLLO_SCREEN_HEIGHT) {
+			PLAT = &platform_apollo;        /* its "Display Reserved" region (devices/mi-10t/xnuloader) */
 		} else {
 			ramfb_phone_screen();
 		}

@@ -7,9 +7,9 @@
  * cores numbered in MPIDR's second affinity field. Cores 0-3 are Cortex-A55s ("small"), 4-6 Cortex-A77s,
  * 7 the fastest Cortex-A77.
  *
- * The phone is recognised by its screen (efi_main): its UEFI's GOP framebuffer is allocated at boot, so
- * there is no fixed base to match as on the POCO, and a 1080x2400 mode that is not the POCO's base is
- * taken to be this phone until its base is known.
+ * The phone is recognised by its screen (efi_main), as the POCO is: a 1080x2400 GOP mode whose framebuffer is
+ * at 0x9C000000, the "Display Reserved" region of this phone's UEFI (devices/mi-10t/uefi: apolloPkg's
+ * MemoryMapLib.c and uefiplat.cfg, 0x9C000000, 0x02400000). Any other 1080x2400 screen is not taken for it.
  */
 static const struct platform platform_apollo = {
 	.name = "apollo", .io_base = 0x00400000, .io_size = 0x3FC00000,
@@ -20,3 +20,4 @@ static const struct platform platform_apollo = {
 
 #define APOLLO_SCREEN_WIDTH  1080
 #define APOLLO_SCREEN_HEIGHT 2400
+#define APOLLO_SCREEN_BASE   0x9C000000ULL

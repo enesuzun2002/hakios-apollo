@@ -79,9 +79,10 @@ Each driver is off unless its own boot-arg is given. The head of each file says 
 
 ## What is still provisional
 
-- The loader recognises the phone by its 1080x2400 screen when the framebuffer is not the POCO's
-  (`xnuloader/platform.h`). `MemoryMapLib.c` reserves the display at 0x9C000000. Once that is
-  confirmed as the GOP base, it can be matched like the POCO's.
+- The loader recognises the phone by its 1080x2400 screen at 0x9C000000, the display region
+  `MemoryMapLib.c` reserves (`xnuloader/platform.h`). That this is the GOP's base on the phone is
+  still to be seen in a loader log ("display 1080 x 2400 at 9c000000"); if it is not, the loader
+  says "platform qemu-virt" and the base in platform.h wants changing.
 - The modem and the IPA are not brought up on this phone. `soc.args` and `pull-soc.sh` are not
   here: the `soc_*` arguments feed the POCO's modem and IPA drivers, which are not ported to
   this phone.
