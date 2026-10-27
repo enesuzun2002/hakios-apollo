@@ -1,8 +1,8 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index be702e28890d..26ee71fa15db 100644
+index be702e28890d..92e826563fdc 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -125,6 +125,15 @@ bsd/dev/hakios.cpufreq.c	standard
+@@ -125,6 +125,20 @@ bsd/dev/hakios.cpufreq.c	standard
  bsd/dev/hakios.adreno.c	standard
  bsd/dev/hakios.audio.c		standard
  bsd/dev/hakios.virtio_sound.c	standard
@@ -15,6 +15,11 @@ index be702e28890d..26ee71fa15db 100644
 +bsd/dev/hakios.apollo_display.c		standard
 +bsd/dev/hakios.apollo_frames.c		standard
 +bsd/dev/hakios.apollo_adreno.c		standard
++bsd/dev/hakios.apollo_adsp.c		standard
++bsd/dev/hakios.apollo_sound.c		standard
++bsd/dev/hakios.apollo_cs35l41.c		standard
++bsd/dev/hakios.apollo_audio.c		standard
++bsd/dev/hakios.apollo_guard.c		standard
  bsd/dev/hakios.speaker.c	standard
  bsd/dev/hakios.guard.c		standard
  bsd/dev/hakios.haptic.c		standard
@@ -560,13 +565,15 @@ index c07be8d9e0b0..f9a2acfde934 100644
  iokit/Kernel/hakios.battery.cpp			optional iokitcpp
  iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 diff --git a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
-index 9dcd99b939e8..f6882800378c 100644
+index 9dcd99b939e8..20f7af59c869 100644
 --- a/osfmk/arm64/loader_return.c
 +++ b/osfmk/arm64/loader_return.c
-@@ -53,6 +53,10 @@ extern void hakios_adsp_stop(void);
+@@ -53,6 +53,12 @@ extern void hakios_adsp_stop(void);
  extern void hakios_adsp_quiesce(void);
  extern void hakios_mpss_stop(void);
  extern void hakios_mpss_quiesce(void);
++extern void apollo_adsp_stop(void);          /* the Mi 10T's audio DSP (devices/mi-10t: hakios.apollo_adsp.c) */
++extern void apollo_adsp_quiesce(void);
 +extern void apollo_adreno_quiesce(void);      /* the Mi 10T's GPU (hakios.apollo_adreno.c) */
 +extern void apollo_adreno_stop(void);
 +extern void apollo_display_quiesce(void);     /* the Mi 10T's panel back on the boot framebuffer (hakios.apollo_display.c) */
@@ -574,28 +581,31 @@ index 9dcd99b939e8..f6882800378c 100644
  extern void hakios_ddr_quiesce(void);
  extern void hakios_haptic_quiesce(void);
  extern void hakios_torch_quiesce(void);
-@@ -376,6 +380,8 @@ loader_return(void)
+@@ -376,6 +382,9 @@ loader_return(void)
  	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
  	hakios_adsp_quiesce();         /* nor the audio DSP */
  	hakios_mpss_quiesce();         /* nor the modem */
++	apollo_adsp_quiesce();          /* (the Mi 10T's: its amplifiers off, its DSP stopped; nothing if it was not started) */
 +	apollo_display_quiesce();       /* (the Mi 10T's panel back on the boot framebuffer, if it was flipped) */
 +	apollo_adreno_quiesce();        /* (the Mi 10T's GPU block, if it was started: its SMMU contexts point into memory about to be reused) */
  	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
  	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
  	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
-@@ -444,6 +450,8 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
+@@ -444,6 +453,9 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
  		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
  		hakios_adsp_stop();            /* and the audio DSP */
  		hakios_mpss_stop();            /* and the modem */
++		apollo_adsp_stop();             /* (the Mi 10T's, if it was started) */
 +		apollo_adreno_stop();           /* (the Mi 10T's GPU, if kept for the system: given back while there is a thread to wait in) */
 +		apollo_backlight_stop();        /* (and its light, as the firmware had it, if it was taken over) */
  	}
  	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
  	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
-@@ -490,6 +498,8 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
+@@ -490,6 +502,9 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
  		hakios_adreno_stop();
  		hakios_wifi_stop();
  		hakios_adsp_stop();
++		apollo_adsp_stop();
 +		apollo_adreno_stop();
 +		apollo_backlight_stop();
  		loader_return();

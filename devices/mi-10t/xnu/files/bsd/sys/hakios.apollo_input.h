@@ -34,8 +34,38 @@ void apollo_backlight_power(bool on);   /* the display switched off or on */
 void apollo_backlight_stop(void);       /* the run ends: the light as the firmware had it */
 void apollo_adreno_init(void);  /* apollo_gpu=N: the Adreno 650, steps 1 to N (bsd/dev/hakios.apollo_adreno.c) */
 
+/*
+ * The sound (apollo_audio=N): the audio DSP (bsd/dev/hakios.apollo_adsp.c), the speakers' path through it (hakios.apollo_sound.c).
+ * The APR types are the shared ones of sys/hakios.audio.h.
+ */
+#include <sys/hakios.audio.h>
+void apollo_adsp_init(void);
+void apollo_adsp_stop(void);            /* the run ends in order: the sound down, the DSP shut down (loader_return.c) */
+void apollo_adsp_quiesce(void);         /* a panic's way back: amplifiers off, the DSP stopped, no lock, no sleep */
+bool apollo_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t wait_ms, struct hakios_apr_answer *answer);
+void apollo_adsp_apr_events(hakios_apr_events_t handler);
+void apollo_adsp_apr_events_second(hakios_apr_events_t handler);
+const uint8_t *apollo_adsp_fw_file(const char *name, uint64_t *size);
+void apollo_adsp_fw_free(const uint8_t *data, uint64_t size);
+void apollo_sound_dsp_up(void);         /* the DSP's audio services are up */
+void apollo_sound_dsp_down(void);       /* the DSP is about to be shut down */
+void apollo_sound_quiesce(void);        /* a panic's way back */
+bool apollo_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes);
+void apollo_audio_dsp_memory_put(void);
+/* the two CS35L41 amplifiers (bsd/dev/hakios.apollo_cs35l41.c), as hakios_speaker_* are for the Awinic ones */
+bool apollo_cs35l41_prepare(const uint8_t *config, uint64_t size);
+bool apollo_cs35l41_start(void);
+bool apollo_cs35l41_volume(uint32_t below, uint32_t step_ms);
+bool apollo_cs35l41_healthy(void);
+void apollo_cs35l41_stop(void);
+void apollo_cs35l41_quiesce(void);
+uint32_t apollo_cs35l41_monitor(bool tell);
+
 void apollo_touch_screen(bool on);      /* the display is off or on: the touch chip sleeps or wakes (hakios.apollo_touch.c) */
 void apollo_cpufreq_screen(bool on);   /* the display off: every core group at its lowest speed (bsd/dev/hakios.apollo_cpufreq.c) */
 
+#include <kern/locks.h>
+extern lck_mtx_t apollo_smmu_lock;      /* the apps SMMU's match registers and contexts: whoever takes one (hakios.apollo_sound.c, hakios.apollo_pcie.c) */
 
 #endif /* _SYS_APOLLO_INPUT_H_ */

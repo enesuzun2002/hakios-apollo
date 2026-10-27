@@ -5,6 +5,7 @@
  */
 #include <pexpert/pexpert.h>
 #include <sys/hakios.apollo_input.h>
+#include <sys/hakios.apollo_audio.h>
 #include <sys/systm.h>
 
 void
@@ -23,4 +24,6 @@ apollo_input_init(void)
 	apollo_touch_init();
 	apollo_buttons_init();
 	apollo_battery_init();
+	apollo_audio_init();             /* /dev/apollo-audio, for iOS's audio plug-in */
+	apollo_adsp_init();              /* apollo_audio=N: the audio DSP, and from it the speakers */
 }
