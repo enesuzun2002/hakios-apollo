@@ -469,10 +469,73 @@ dt_prop_padded(struct dt_writer *w, const char *name, const char *value, uint32_
  */
 static int gamut_p3;    /* boot-arg gamut=p3 (a test): the iPhone's own "P3" left in place */
 
+/*
+ * Alternative identity (boot-arg identity=iphone12,3): the iPhone 11 Pro, for the iOS 26 files (tools/ios26,
+ * built for iPhone12,3). The default, without the arg, stays the iPhone X above. Values are laid over the
+ * iPhone X's properties of identity.h by name (the screen, 1125x2436 @3x, OLED, "P3" -> sRGB as above,
+ * is the same, so what is not listed here is the iPhone X's). Sources: ios26/BuildManifest.plist
+ * (iPhone12,3: DeviceClass d421ap, ApChipID 0x8030, ApBoardID 0x06; iPhone12,5 is d431ap, board 0x02),
+ * the A13 being T8030, and Apple's naming of device trees (target-type "D421", sub-type "D421AP").
+ * No iPhone12,3 DeviceTree.d421ap.bin is on disk, so mkidentity.py could not be run for it: values that
+ * are not from the manifest are marked TODO and want checking against that device tree.
+ */
+struct identity_over { const char *name; const void *value; unsigned length; };
+#define IO_STR(n, s) { n, s, sizeof(s) }
+#define IO_U32(n, v) { n, (const uint32_t[]){ v }, 4 }
+
+static const struct identity_over iphone12_3_root[] = {
+	IO_STR("target-type", "D421"),
+	IO_STR("target-sub-type", "D421AP"),
+	{ "compatible", "D421AP\0iPhone12,3\0AppleARM", sizeof("D421AP\0iPhone12,3\0AppleARM") },
+	IO_STR("model", "iPhone12,3"),
+};
+
+static const struct identity_over iphone12_3_product[] = {
+	IO_STR("product-name", "iPhone 11 Pro"),                /* TODO: real tree may say "iPhone" */
+	IO_STR("product-description", "iPhone 11 Pro"),         /* TODO: check against the real tree */
+	IO_STR("graphics-featureset-class", "APPLE6"),          /* TODO: A13 = Metal GPU family Apple6 */
+	IO_STR("graphics-featureset-fallbacks", "APPLE5:APPLE4:APPLE3:APPLE3v1:APPLE2:APPLE1:GLES2,0"), /* TODO */
+	IO_STR("compatible-device-fallback", "iPhone11,2"),     /* TODO: guess, the XS the 11 Pro replaced */
+	IO_STR("wifi-chipset", "4377"),                         /* TODO: BCM4377, believed of the iPhone 11 family */
+	IO_STR("baseband-chipset", "xmm7660"),                  /* TODO: Intel XMM7660 (iPhone 11 Pro) */
+	IO_U32("device-perf-memory-class", 4),                  /* TODO: 4 GB */
+	/* artwork-scale-factor 3, artwork-device-subtype 2436, oled-display, thin-bezel, button locations: as
+	 * the iPhone X (same screen); TODO: button location offsets of the 11 Pro are not checked. */
+};
+
+static int identity_11pro;      /* boot-arg identity=iphone12,3 */
+
+static const struct identity_over *
+identity_over_find(const struct identity_over *o, unsigned count, const char *name)
+{
+	for (unsigned i = 0; o != NULL && i < count; i++) {
+		if (str_eq(o[i].name, name)) {
+			return &o[i];
+		}
+	}
+	return NULL;
+}
+
+
 static void
 dt_identity(struct dt_writer *w, const struct identity_prop *props, uint32_t count, const unsigned char *data)
 {
+	const struct identity_over *o = NULL;
+	unsigned ocount = 0;
+
+	if (identity_11pro) {
+		if (props == identity_root) {
+			o = iphone12_3_root; ocount = sizeof(iphone12_3_root) / sizeof(iphone12_3_root[0]);
+		} else if (props == identity_product) {
+			o = iphone12_3_product; ocount = sizeof(iphone12_3_product) / sizeof(iphone12_3_product[0]);
+		}
+	}
 	for (uint32_t i = 0; i < count; i++) {
+		const struct identity_over *x = identity_over_find(o, ocount, props[i].name);
+		if (x != NULL) {
+			dt_prop(w, props[i].name, x->value, x->length);
+			continue;
+		}
 		if (str_eq(props[i].name, "artwork-display-gamut") && !gamut_p3) {
 			dt_prop(w, props[i].name, "sRGB", 5);
 			continue;
@@ -2872,6 +2935,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
+	identity_11pro = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
 	 * loader asked for (the loader stays resident across runs) */
 	block_write_requested = 0;
@@ -2892,6 +2956,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
+		identity_11pro |= starts_with(c, "identity=iphone12,3") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
 			ufs_requested = c[4] - '0';
@@ -3071,13 +3136,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * those of that phone. XNU itself does not care; the hardware is described further down.
 	 */
 	dt_identity(&w, identity_root, sizeof(identity_root) / sizeof(identity_root[0]), identity_root_data);
-	dt_prop_str(&w, "platform-name", "t8015");
+	dt_prop_str(&w, "platform-name", identity_11pro ? "t8030" : "t8015");
 	/* what iBoot takes from the factory configuration of a real phone; fixed size fields */
 	dt_prop_padded(&w, "serial-number", "RDW00POCOX5P", 32);
 	dt_prop_padded(&w, "mlb-serial-number", "RDW00POCOX5PMLB00", 32);
-	dt_prop_padded(&w, "model-number", "MQAC2", 32);
+	dt_prop_padded(&w, "model-number", identity_11pro ? "MWC22" : "MQAC2", 32);   /* 11 Pro: TODO verify */
 	dt_prop_padded(&w, "region-info", "LL/A", 32);
-	dt_prop_padded(&w, "regulatory-model-number", "A1865", 32);
+	dt_prop_padded(&w, "regulatory-model-number", identity_11pro ? "A2160" : "A1865", 32);   /* 11 Pro: TODO verify */
 	dt_prop_u32(&w, "#address-cells", 2);
 	dt_prop_u32(&w, "#size-cells", 2);
 
@@ -3106,8 +3171,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	static const uint8_t manifest_hash[48] = { 0x72, 0x65, 0x64, 0x77, 0x6f, 0x6f, 0x64 };
 	static const uint8_t no_behavior[16];
 	dt_prop_u64(&w, "unique-chip-id", 0x000052445730001ULL);
-	dt_prop_u32(&w, "chip-id", 0x8015);
-	dt_prop_u32(&w, "board-id", 0x06);
+	dt_prop_u32(&w, "chip-id", identity_11pro ? 0x8030 : 0x8015);   /* 11 Pro: BuildManifest ApChipID */
+	dt_prop_u32(&w, "board-id", 0x06);   /* d421ap: BuildManifest ApBoardID 0x06 (iPhone X is 0x06 too) */
 	dt_prop(&w, "mac-address-wifi0", wifi_address, sizeof(wifi_address));
 	dt_prop(&w, "mac-address-bluetooth0", bluetooth_address, sizeof(bluetooth_address));
 	dt_prop(&w, "boot-manifest-hash", manifest_hash, sizeof(manifest_hash));
