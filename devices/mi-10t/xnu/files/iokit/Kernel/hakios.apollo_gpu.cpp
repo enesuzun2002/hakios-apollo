@@ -1,5 +1,5 @@
 /*
- * ApolloGPU: the Mi 10T's Adreno 650 for programs to draw with. A copy of hakios.apollo_gpu.cpp (the POCO X5 Pro's, which
+ * ApolloGPU: the Mi 10T's Adreno 650 for programs to draw with. A copy of hakios.gpu.cpp (the POCO X5 Pro's, which
  * has the long explanations), kept apart from it: the same interface of Linux's msm driver -- the one Mesa's
  * freedreno speaks, through the libdrm stand-in of tools/mesa/hakios-drm, which looks for ApolloGPU first -- on
  * the kept-on API of bsd/dev/hakios.apollo_adreno.c (apollo_gpu_*) instead of hakios.adreno.c's. The selectors of our own
@@ -24,17 +24,17 @@
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 
 extern "C" {
-/* bsd/dev/hakios.adreno.c ("the GPU kept on"; declared in bsd/sys/hakios.input.h, which is not seen from here) */
+/* bsd/dev/hakios.apollo_adreno.c ("the GPU kept on"; declared here only: no header of bsd/sys is seen from here) */
 bool apollo_gpu_ready(void);
 bool apollo_gpu_parameter(uint32_t which, uint64_t * value);
 uint64_t apollo_gpu_address(uint64_t size);
 void apollo_gpu_address_free(uint64_t address, uint64_t size);
 void apollo_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, unsigned * holes, unsigned * most,
     uint64_t * lost, uint32_t * refused);
-extern uint32_t apollo_gpu_va;                 /* boot-arg apollo_gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
+extern uint32_t apollo_gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
 bool apollo_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 void apollo_gpu_mapped(void);
-void apollo_gpu_unmap(uint64_t address, uint64_t size);
+bool apollo_gpu_unmap(uint64_t address, uint64_t size);       /* false: the SMMU may still see the pages: keep them */
 void apollo_gpu_to_memory(void * start, uint64_t size);
 uint32_t apollo_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint64_t apollo_gpu_phase[4];           /* the last submission's ticks: ring room, times, ring writes, doorbell */
@@ -175,7 +175,7 @@ struct apollo_scanout {
  * A program timing this driver (userland/src/metal_drv_test.m --time) can measure only wall
  * time: the whole of a draw, which is its own work, this ioctl, the submission, the core's
  * execution and the wait. Nothing it can reach says how much of that was the core -- and the
- * kernel has known all along, because bsd/dev/hakios.adreno.c times every submission off
+ * kernel has known all along, because bsd/dev/hakios.apollo_adreno.c times every submission off
  * CP_ALWAYS_ON_COUNTER (19.2 ticks a microsecond) and until now only ever printed it. This
  * request hands the same three numbers to the program, so the subtraction happens where the
  * two halves are both in hand instead of in whoever reads the log afterwards.
@@ -407,7 +407,7 @@ ApolloGPUStart(void)
 	gpu->release();
 }
 
-/* The run is ending (hakios.adreno.c): nobody is in the middle of anything when the GPU goes. */
+/* The run is ending (hakios.apollo_adreno.c): nobody is in the middle of anything when the GPU goes. */
 void
 ApolloGPUStop(void)
 {
@@ -471,6 +471,13 @@ struct gpu_kept {
 #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
 #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
 static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
+/*
+ * The most a client may have in buffers of its own making (kMsmGemNew), in MB: boot-arg gpu_client_mb, 1024 if
+ * not given. The memory is wired, so one program could otherwise take all of the phone's; the window server's
+ * frames and textures are a few hundred MB at the most. (fBufferBytes, which this is held against, also counts
+ * the IOSurfaces and the panel's frames a client has as buffers.)
+ */
+static TUNABLE(uint32_t, gGPUClientMB, "gpu_client_mb", 1024);
 
 class ApolloGPUUserClient : public IOUserClient
 {
@@ -537,17 +544,53 @@ ApolloGPUUserClient::start(IOService * provider)
 }
 
 /*
- * With the lock held, and the GPU done with everything it has been given (`idle`). If it is
- * not -- it has stopped answering -- the buffer's memory stays the GPU's for good: it may yet be
- * written, and must not be somebody else's by then.
+ * A buffer's addresses out of the GPU's space and free for another. false: the SMMU has not said that it
+ * has forgotten them (apollo_gpu_unmap()): the addresses are not handed out again, and the caller keeps the
+ * memory the GPU's for good (gpuKeepForGood()), as it does a buffer the core is not done with. With the lock held.
+ */
+static bool
+gpuUnmap(uint64_t address, uint64_t size)
+{
+	if (!apollo_gpu_unmap(address, size)) {
+		return false;
+	}
+	apollo_gpu_address_free(address, size);
+	return true;
+}
+
+/* Memory the GPU may still reach: a reference that is never let go of, so that it is nobody else's. */
+static void
+gpuKeepForGood(IOMemoryDescriptor * memory, MiniIOSurface * surface)
+{
+	if (surface == NULL) {
+		memory->retain();
+	} else {
+		surface->memory->retain();
+	}
+}
+
+/*
+ * With the lock held. A buffer the GPU is not done with is left (fLeft) until it is, or, with
+ * nowhere to leave it, waited for; if the GPU has stopped answering, the buffer's memory stays
+ * the GPU's for good: it may yet be written, and must not be somebody else's by then.
+ *
+ * The handle is free from the start, before the wait lets go of the lock: what is given back is a
+ * copy of the slot, so another thread giving back the same handle meanwhile finds nothing there,
+ * and one making a buffer may have the slot again.
  */
 void
-ApolloGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ApolloGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 {
-	bool busy = apollo_gpu_ready() && b->fence != 0 && !apollo_gpu_done(b->fence);
+	struct gpu_buffer copy = *slot, * b = &copy;
+	bool busy, lost;
 
+	slot->memory = NULL;
+	slot->surface = NULL;
+	fBufferCount--;
+	fBufferBytes -= b->size;
+	busy = apollo_gpu_ready() && b->fence != 0 && !apollo_gpu_done(b->fence);
 	if (busy && fLeftCount == GPU_LEFT) {
-		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for; fLeftCount is looked at again after) */
 	}
 	if (busy && fLeftCount < GPU_LEFT) {
 		struct gpu_left * left = &fLeft[fLeftCount++];
@@ -560,14 +603,10 @@ ApolloGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		left->flags = b->flags;
 		left->scanout = b->scanout;
 	} else {
+		lost = busy;
 		if (busy) {
 			static uint32_t said;
 
-			if (b->surface == NULL) {
-				b->memory->retain();
-			} else {
-				b->surface->memory->retain();
-			}
 			if (said++ < 8) {
 				IOLog("ApolloGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
 			}
@@ -575,8 +614,10 @@ ApolloGPUUserClient::freeBuffer(struct gpu_buffer * b)
 		    keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
 			b->memory = NULL;               /* (now the kept one's) */
 		} else if (apollo_gpu_ready()) {
-			apollo_gpu_unmap(b->address, b->size);
-			apollo_gpu_address_free(b->address, b->size);
+			lost = !gpuUnmap(b->address, b->size);
+		}
+		if (lost) {
+			gpuKeepForGood(b->memory, b->surface);
 		}
 		if (b->memory != NULL) {
 			b->memory->release();
@@ -585,10 +626,6 @@ ApolloGPUUserClient::freeBuffer(struct gpu_buffer * b)
 			MiniIOSurfaceDrop(b->surface);
 		}
 	}
-	b->memory = NULL;
-	b->surface = NULL;
-	fBufferCount--;
-	fBufferBytes -= b->size;
 }
 
 /* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
@@ -605,9 +642,8 @@ ApolloGPUUserClient::reap(void)
 		if (left->surface == NULL && left->scanout == 0 && apollo_gpu_ready() &&
 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
 			left->memory = NULL;
-		} else if (apollo_gpu_ready()) {
-			apollo_gpu_unmap(left->address, left->size);
-			apollo_gpu_address_free(left->address, left->size);
+		} else if (apollo_gpu_ready() && !gpuUnmap(left->address, left->size)) {
+			gpuKeepForGood(left->memory, left->surface);
 		}
 		if (left->memory != NULL) {
 			left->memory->release();
@@ -622,12 +658,18 @@ ApolloGPUUserClient::reap(void)
 IOReturn
 ApolloGPUUserClient::clientClose(void)
 {
+	uint32_t reserved;
+
+	/* (taken under the lock, given back outside it: the display's driver takes gGPULock under locks of its own) */
+	IOLockLock(gGPULock);
+	reserved = fScanReserved;
+	fScanReserved = 0;
+	IOLockUnlock(gGPULock);
 	for (unsigned i = 0; i < 3; i++) {
-		if (fScanReserved & (1u << i)) {
+		if (reserved & (1u << i)) {
 			apollo_scanout_release(i);              /* (a window server that is gone has no frame to be waited for) */
 		}
 	}
-	fScanReserved = 0;
 	if (fBuffers != NULL) {
 		IOLockLock(gGPULock);
 		/* what the client had the GPU do last may still be going on, in these buffers */
@@ -687,6 +729,9 @@ ApolloGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	struct gpu_buffer * b = NULL;
 	bool mapped = true;
 
+	if (!apollo_gpu_ready()) {
+		return NULL;                            /* (given back while the caller was not holding the lock: the run is ending) */
+	}
 	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
 		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
 
@@ -709,8 +754,9 @@ ApolloGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	}
 	apollo_gpu_mapped();
 	if (!mapped) {
-		apollo_gpu_unmap(b->address, size);
-		apollo_gpu_address_free(b->address, size);
+		if (!gpuUnmap(b->address, size)) {
+			memory->retain();               /* (what was entered may still be seen: stays the GPU's, gpuKeepForGood()) */
+		}
 		IOLog("ApolloGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
 		return NULL;
 	}
@@ -734,9 +780,8 @@ ApolloGPUUserClient::dropKept(struct gpu_kept * k)
 	if (k->memory == NULL) {
 		return;
 	}
-	if (apollo_gpu_ready()) {
-		apollo_gpu_unmap(k->address, k->size);
-		apollo_gpu_address_free(k->address, k->size);
+	if (apollo_gpu_ready() && !gpuUnmap(k->address, k->size)) {
+		gpuKeepForGood(k->memory, NULL);
 	}
 	k->memory->release();
 	k->memory = NULL;
@@ -794,6 +839,21 @@ ApolloGPUUserClient::gemNew(struct msm_gem_new * request)
 	struct gpu_kept * found = NULL;
 	uint64_t old;
 
+	if (!apollo_gpu_ready()) {
+		IOLockUnlock(gGPULock);
+		return kIOReturnNotReady;                       /* (given back since externalMethod() looked: the run is ending) */
+	}
+	if (fBufferBytes + size > ((uint64_t) gGPUClientMB << 20)) {
+		static uint32_t said;
+
+		IOLockUnlock(gGPULock);
+		if (said++ < 8) {
+			IOLog("ApolloGPU: a buffer of %llu bytes refused: the client has %llu MB in buffers, gpu_client_mb=%u\n", size,
+			    fBufferBytes >> 20, gGPUClientMB);
+		}
+		return kIOReturnNoMemory;
+	}
+
 	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
 	for (uint32_t i = 0; i < GPU_KEPT; i++) {
 		struct gpu_kept * k = &fKept[i];
@@ -810,6 +870,9 @@ ApolloGPUUserClient::gemNew(struct msm_gem_new * request)
 		uint32_t h = (fNextBuffer + n) % GPU_BUFFERS;
 
 		if (fBuffers[h].memory == NULL) {
+			if (gGPUKeep == 2) {
+				bzero(found->kernel, (size_t) found->size);     /* (before the handle is the program's: under the lock) */
+			}
 			b = &fBuffers[h];
 			bzero(b, sizeof(*b));
 			b->memory = found->memory;
@@ -825,9 +888,6 @@ ApolloGPUUserClient::gemNew(struct msm_gem_new * request)
 			fKeptBytes -= size;
 			gGPUStat.given_again++;
 			IOLockUnlock(gGPULock);
-			if (gGPUKeep == 2) {
-				bzero(b->kernel, (size_t) b->size);
-			}
 			return kIOReturnSuccess;
 		}
 	}
@@ -845,7 +905,8 @@ ApolloGPUUserClient::gemNew(struct msm_gem_new * request)
 	}
 
 	IOLockLock(gGPULock);
-	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+	/* (the lock was let go of: the limit again, against what other threads of the client made meanwhile; newBuffer() sees to the GPU being there) */
+	b = fBufferBytes + size > ((uint64_t) gGPUClientMB << 20) ? NULL : newBuffer(memory, 0, size, request->flags, &request->handle);
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
@@ -941,6 +1002,8 @@ ApolloGPUUserClient::surfaceBuffer(struct apollo_surface * request)
  * 3D core's page table entries are PTE_CORE, attribute 0 of MAIR (Linux's: uncached, SMMU_MAIR0 in hakios.apollo_adreno.c), so what
  * the core writes is in memory for the display controller, which reads memory with nothing in between. Rows are of the GPU
  * stride (64-byte multiples; Mesa takes no other pitch of a render target). The same frame asked for again is the same buffer.
+ * It is made whether or not the client has the frame acquired (the window server makes all three when it starts,
+ * userland/src/eagl.c): what is checked is that a submission naming one is of the client that has it acquired (submit()).
  */
 IOReturn
 ApolloGPUUserClient::scanoutBuffer(struct apollo_surface * request)
@@ -1021,26 +1084,37 @@ ApolloGPUUserClient::scanout(struct apollo_scanout * request)
 		}
 		IOLockLock(gGPULock);
 		gScanFence[index] = 0;                  /* (nothing has drawn into it yet) */
-		IOLockUnlock(gGPULock);
 		fScanReserved |= 1u << index;
+		IOLockUnlock(gGPULock);
 		request->index = (uint32_t) index;
 		request->surface = kScanoutSurface + (uint32_t) index;
 		return kIOReturnSuccess;
 	}
+	/*
+	 * fScanReserved is looked at and changed under gGPULock (submit() reads it there too), so that of two
+	 * threads queueing or releasing one frame, one does; the display's driver is called outside the lock.
+	 */
 	case kScanoutQueue:
-		if (request->index > 2 || !(fScanReserved & (1u << request->index))) {
+	case kScanoutRelease: {
+		bool reserved;
+
+		if (request->index > 2) {
 			return kIOReturnBadArgument;
 		}
+		IOLockLock(gGPULock);
+		reserved = (fScanReserved & (1u << request->index)) != 0;
 		fScanReserved &= ~(1u << request->index);       /* (the display's driver has it from here: apollo_scanout_*) */
-		apollo_scanout_mark(request->index, request->swap);
-		return kIOReturnSuccess;
-	case kScanoutRelease:
-		if (request->index > 2 || !(fScanReserved & (1u << request->index))) {
+		IOLockUnlock(gGPULock);
+		if (!reserved) {
 			return kIOReturnBadArgument;
 		}
-		fScanReserved &= ~(1u << request->index);
-		apollo_scanout_release(request->index);
+		if (request->op == kScanoutQueue) {
+			apollo_scanout_mark(request->index, request->swap);
+		} else {
+			apollo_scanout_release(request->index);
+		}
 		return kIOReturnSuccess;
+	}
 	}
 	return kIOReturnBadArgument;
 }
@@ -1095,8 +1169,8 @@ ApolloGPUUserClient::submit(struct msm_gem_submit * request)
 {
 	struct msm_gem_submit_bo * bos = NULL;
 	struct msm_gem_submit_cmd * cmds = NULL;
-	uint64_t addresses[GPU_SUBMIT_CMDS];
-	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
+	uint64_t addresses[GPU_SUBMIT_CMDS] = { 0 };     /* (the first is put in the log even when no command buffer is taken) */
+	uint32_t words[GPU_SUBMIT_CMDS] = { 0 }, count = 0;
 	uint64_t began, nanos, again;
 	uint64_t at_start = mach_absolute_time(), at_copied = at_start, at_locked = at_start, at_flushed = at_start;
 	uint64_t at_submitted = at_start, at_reaped = at_start;
@@ -1120,6 +1194,36 @@ ApolloGPUUserClient::submit(struct msm_gem_submit * request)
 	at_copied = mach_absolute_time();
 	IOLockLock(gGPULock);
 	at_locked = mach_absolute_time();
+	/*
+	 * Looked at again under the lock (externalMethod() looked without it): a GPU given back meanwhile takes
+	 * nothing, and one that has stopped answering and was not recovered (gGPUReported) is given nothing more in
+	 * this run -- as gpuWait() waits for nothing more.
+	 */
+	if (!apollo_gpu_ready() || gGPUReported) {
+		IOLockUnlock(gGPULock);
+		ret = apollo_gpu_ready() ? kIOReturnNotResponding : kIOReturnNotReady;
+		goto out;
+	}
+	/*
+	 * One of the panel's frames is drawn into only by the client that has it acquired (kScanoutAcquire, until
+	 * kScanoutQueue or kScanoutRelease): one that is on the panel, or another program's, is not to be written.
+	 * (The frames are made buffers before they are acquired -- the window server takes all three as textures
+	 * when it starts, userland/src/eagl.c -- so this is where it is checked, not in scanoutBuffer().)
+	 */
+	for (uint32_t i = 0; i < request->nr_bos; i++) {
+		struct gpu_buffer * b = buffer(bos[i].handle);
+
+		if (b != NULL && b->scanout != 0 && !(fScanReserved & (1u << (b->scanout - 1)))) {
+			static uint32_t said;
+
+			IOLockUnlock(gGPULock);
+			if (said++ < 8) {
+				IOLog("ApolloGPU: a submission names panel frame %u, which the client has not acquired: not taken\n",
+				    b->scanout - 1);
+			}
+			goto out;
+		}
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
@@ -1267,7 +1371,7 @@ ApolloGPUUserClient::submit(struct msm_gem_submit * request)
 			 * The address space itself, because nothing else said anything about it: what
 			 * argument buffers and heaps are built on is that this allocator holds, and
 			 * "lost" and "refused" are the two ways it stops holding (bsd/dev/
-			 * hakios.adreno.c, apollo_gpu_address_free).
+			 * hakios.apollo_adreno.c, apollo_gpu_address_free).
 			 */
 			uint64_t used, largest, lost;
 			uint32_t live, refused;
@@ -1392,8 +1496,8 @@ ApolloGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
 	}
-	if (!apollo_gpu_ready() && selector != kApolloShow) {
-		return kIOReturnNotReady;                       /* given back: the run is ending */
+	if (!apollo_gpu_ready()) {
+		return kIOReturnNotReady;                       /* given back: the run is ending (kApolloShow too: the panel is not ours then) */
 	}
 	bzero(&r, sizeof(r));
 	memcpy(&r, args->structureInput, size);
@@ -1421,6 +1525,15 @@ ApolloGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
 				waitOver(&r.cpuPrep.timeout, apollo_gpu_last());
 			}
+		} else if ((b = buffer(r.cpuPrep.handle)) != NULL && b->scanout == 0 && (b->surface != NULL || gGPUCached)) {
+			/*
+			 * The GPU is done, and the program is about to look: memory that this processor caches (an
+			 * IOSurface's; a buffer of the program's own with gpu_cached=1) may have lines in the cache
+			 * from before the GPU wrote it -- read ahead while the GPU was at work -- which would be seen
+			 * instead of what it wrote. Out of the cache. (Write-combined buffers, the usual, and the
+			 * panel's frames are not cached: nothing to do.)
+			 */
+			apollo_gpu_to_memory(b->kernel, b->size);
 		}
 		IOLockUnlock(gGPULock);
 		slowWait("cpu-prep", waitBegan);

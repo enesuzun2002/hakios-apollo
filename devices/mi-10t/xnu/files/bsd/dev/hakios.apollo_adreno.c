@@ -1232,7 +1232,12 @@ step_zap_signature(void)
 #define SMMU_MAIR0              0xf404ff44      /* Linux's: 0 uncached, 1 cached, 2 device */
 #define SMMU_FSR_ALL            0xc00001fe
 
-#define SPACE_TABLES            1024            /* 2 GB of addresses, were they all in use */
+/*
+ * Every table of a space, of any level: enough for the whole of the first 4 GB, which is where the 3D core's
+ * addresses are (the steps' below GPU_ADDRESSES_START, the clients' from there up to 4 GB: checked below,
+ * where those are): 2048 tables of the last level (2 MB each), 4 above them and the root.
+ */
+#define SPACE_TABLES            2056
 
 struct gpu_space {
 	const char *name;
@@ -1584,7 +1589,10 @@ step_gmu_firmware(void)
 			if (block.size == 0) {
 				continue;
 			}
-			if (in_tcm(block.address) && in_tcm(block.address + block.size - 1)) {
+			/* (ends worked out in 64 bits: a block's address and size are the file's to say, and must not wrap) */
+			if (in_tcm(block.address) && (uint64_t)block.address + block.size - 1 <= 0xffffffffull &&
+			    in_tcm(block.address + block.size - 1) &&
+			    (block.address < GMU_DTCM_ADDRESS) == (block.address + block.size - 1 < GMU_DTCM_ADDRESS)) {
 				uint32_t registers = block.address < GMU_DTCM_ADDRESS ? GMU_ITCM + block.address - GMU_ITCM_ADDRESS :
 				    GMU_DTCM + block.address - GMU_DTCM_ADDRESS;
 
@@ -1611,7 +1619,7 @@ step_gmu_firmware(void)
 					return false;
 				}
 				if (block.address >= gmu_blocks[i].address &&
-				    block.address + block.size <= gmu_blocks[i].address + gmu_blocks[i].size) {
+				    (uint64_t)block.address + block.size <= gmu_blocks[i].address + gmu_blocks[i].size) {
 					memcpy((void *)(gmu_blocks[i].memory + (block.address - gmu_blocks[i].address)), data, block.size);
 					to_memory(gmu_blocks[i].memory, gmu_blocks[i].size);
 					say("apollo gpu: %u: %#x bytes at the GMU's %#x, in memory\n", step, block.size, block.address);
@@ -1898,15 +1906,24 @@ struct hfi_bw_table {
 static uint32_t hfi_number;
 static bool core_is_on;
 
-/* everything waiting in a queue of the GMU's; true if the answer to the message numbered `number` was among it */
+/*
+ * everything waiting in a queue of the GMU's; true if the answer to the message numbered `number` was among it.
+ * How far the GMU has written is the GMU's word in shared memory: taken once, and only if it is a place in the
+ * queue where a message can begin (messages are whole multiples of four words); and no more messages than fit.
+ */
 static bool
 hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
 {
 	volatile struct hfi_queue *queue = &hfi->queue[which];
 	volatile uint32_t *data = (volatile uint32_t *)((vm_offset_t)hfi + HFI_QUEUE_AT(which));
+	uint32_t write = queue->write;
 	bool answered = false;
 
-	while (queue->read != queue->write) {
+	if (write >= HFI_QUEUE_WORDS || (write & 3)) {
+		say("apollo gpu: %u: the GMU's queue %u says it is written up to %#x: not a place in it\n", step, which, write);
+		return false;
+	}
+	for (uint32_t messages = 0; queue->read % HFI_QUEUE_WORDS != write && messages < HFI_QUEUE_WORDS / 4; messages++) {
 		uint32_t message[8] = { 0 }, at = queue->read % HFI_QUEUE_WORDS, words = data[at] >> 8 & 0xff;
 
 		for (uint32_t i = 0; i < words; i++) {
@@ -1943,8 +1960,15 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	volatile struct hfi_queue *queue = &hfi->queue[0];
 	volatile uint32_t *data = (volatile uint32_t *)((vm_offset_t)hfi + HFI_QUEUE_AT(0));
 	uint32_t at = queue->write % HFI_QUEUE_WORDS, number = ++hfi_number & 0xfff, verdict = 0, waiting = 0;
+	uint32_t room = (queue->read % HFI_QUEUE_WORDS + HFI_QUEUE_WORDS - at - 1) % HFI_QUEUE_WORDS;
 	bool answered = false;
 
+	if (room < (words + 3) / 4 * 4) {
+		/* (the GMU has not taken what it was sent before: writing on would overwrite it) */
+		say("apollo gpu: %u: no room in the GMU's queue for %s: %u words free of %u, read up to %u, written up to %u\n", step,
+		    what, room, HFI_QUEUE_WORDS, queue->read, queue->write);
+		return false;
+	}
 	message[0] = id | words << 8 | number << 20;
 	if (!quiet) {
 		say("apollo gpu: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
@@ -2139,6 +2163,18 @@ step_core_power(void)
 #define PTE_UNPRIVILEGED        (1ull << 6)     /* the 3D core's accesses are; the GMU's are not */
 #define PTE_READ_ONLY           (1ull << 7)
 #define PTE_CORE                (PTE_GMU | PTE_UNPRIVILEGED)
+/*
+ * What is the kernel's alone in the 3D core's space -- the ring and the scratch page with the fences and the
+ * times -- is mapped for privileged accesses only, so that a program's command buffers cannot read or write
+ * it (Linux: MSM_BO_MAP_PRIV, IOMMU_PRIV, for the ring and its memptrs when the GPU has hw_apriv, which the
+ * a650 has). That works because CP_APRIV_CNTL (step 20) makes the command processor's own fetches of the
+ * ring and its writes from the ring privileged, as Linux's a6xx hw_init does. The microcode stays as Linux
+ * maps it (adreno_fw_create_bo: read-only, not privileged): it is the public a650_sqe.fw. Boot-arg
+ * gpu_protect=0: none of this (and no CP_PROTECT either, step 20) -- as before, for a phone where it does
+ * not work; it is not yet tried on the hardware.
+ */
+static uint32_t gpu_protect = 1;
+#define PTE_CORE_OWN            (gpu_protect ? PTE_GMU : PTE_CORE)
 #define CORE_RING_ADDRESS       0x01000000u
 #define CORE_RING_SIZE          0x8000u         /* Linux's; 8192 words */
 #define CORE_SQE_ADDRESS        0x01100000u
@@ -2160,6 +2196,12 @@ step_core_power(void)
 #define CP_PROTECT_STATUS       GPU_WORD(0x0824)
 #define CP_SQE_INSTR_BASE       GPU_WORD(0x0830)
 #define CP_APRIV_CNTL           GPU_WORD(0x0844)
+#define CP_PROTECT_CNTL         GPU_WORD(0x084f)
+#define CP_PROTECT(n)           GPU_WORD(0x0850 + (n))
+#define CP_PROTECTS             48              /* the a650's count_max (DECLARE_ADRENO_PROTECT(a650_protect, 48)) */
+#define CP_PROTECT_CNTL_ON      (1u << 0 | 1u << 1 | 1u << 3)   /* access protection, fault on violation, last span to the end */
+#define PROTECT_RDONLY(reg, len) (((len) & 0x3fffu) << 18 | ((reg) & 0x3ffffu))
+#define PROTECT_NORDWR(reg, len) (1u << 31 | PROTECT_RDONLY(reg, len))
 #define CP_ROQ_THRESHOLDS_1     GPU_WORD(0x08c1)
 #define CP_ROQ_THRESHOLDS_2     GPU_WORD(0x08c2)
 #define CP_MEM_POOL_SIZE        GPU_WORD(0x08c3)
@@ -2269,9 +2311,9 @@ step_core_space(void)
 	announce("make the 3D core's memory: its ring, its microcode (fw/a650_sqe.fw), a page to try writing to");
 	microcode = image_file("a650_sqe.fw", &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
-	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
+	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE_OWN) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
-	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, PTE_CORE)) {
+	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, PTE_CORE_OWN)) {
 		return false;
 	}
 	memcpy((void *)core_sqe.memory, microcode + 4, size - 4);       /* the file's first word is not microcode */
@@ -2379,8 +2421,10 @@ step_zap_load(void)
 
 /*
  * Linux's a6xx_gpu.c hw_init, the a650's branches, less what only matters once it draws (clock gating,
- * the protection of registers against user programs' commands, counters' selection, interrupts): the
- * values are checked against it one by one. UBWC (a6xx_set_ubwc_config with SM8250's ubwc_4_0_hbb16:
+ * counters' selection, interrupts): the values are checked against it one by one. The protection of
+ * registers against user programs' commands (a6xx_set_cp_protect) is in, unless gpu_protect=0: programs'
+ * command buffers reach the core, and without it they may write the registers that say where the ring,
+ * the microcode and the SMMU's tables are. UBWC (a6xx_set_ubwc_config with SM8250's ubwc_4_0_hbb16:
  * UBWC 4.0, highest bank bit 16): the same values Mesa will be told.
  */
 static bool
@@ -2422,6 +2466,41 @@ step_core_start(void)
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
 	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
+	if (gpu_protect) {
+		/*
+		 * The ranges of registers a command buffer that is not the ring's may not write (and some not
+		 * read): Linux's a650_protect_regs (drivers/gpu/drm/msm/adreno/a6xx_catalog.c, before that
+		 * a6xx_gpu.c; "these are for a620 and a650"), written as a6xx_set_cp_protect writes them: the
+		 * last entry into the last register, its span to the end of the registers.
+		 */
+		static const uint32_t a650_protect[] = {
+			PROTECT_RDONLY(0x00000, 0x04ff), PROTECT_RDONLY(0x00501, 0x0005), PROTECT_RDONLY(0x0050b, 0x02f4),
+			PROTECT_NORDWR(0x0050e, 0x0000), PROTECT_NORDWR(0x00510, 0x0000), PROTECT_NORDWR(0x00534, 0x0000),
+			PROTECT_NORDWR(0x00800, 0x0082), PROTECT_NORDWR(0x008a0, 0x0008), PROTECT_NORDWR(0x008ab, 0x0024),
+			PROTECT_RDONLY(0x008de, 0x00ae), PROTECT_NORDWR(0x00900, 0x004d), PROTECT_NORDWR(0x0098d, 0x0272),
+			PROTECT_NORDWR(0x00e00, 0x0001), PROTECT_NORDWR(0x00e03, 0x000c), PROTECT_NORDWR(0x03c00, 0x00c3),
+			PROTECT_RDONLY(0x03cc4, 0x1fff), PROTECT_NORDWR(0x08630, 0x01cf), PROTECT_NORDWR(0x08e00, 0x0000),
+			PROTECT_NORDWR(0x08e08, 0x0000), PROTECT_NORDWR(0x08e50, 0x001f), PROTECT_NORDWR(0x08e80, 0x027f),
+			PROTECT_NORDWR(0x09624, 0x01db), PROTECT_NORDWR(0x09e60, 0x0011), PROTECT_NORDWR(0x09e78, 0x0187),
+			PROTECT_NORDWR(0x0a630, 0x01cf), PROTECT_NORDWR(0x0ae02, 0x0000), PROTECT_NORDWR(0x0ae50, 0x032f),
+			PROTECT_NORDWR(0x0b604, 0x0000), PROTECT_NORDWR(0x0b608, 0x0007), PROTECT_NORDWR(0x0be02, 0x0001),
+			PROTECT_NORDWR(0x0be20, 0x17df), PROTECT_NORDWR(0x0f000, 0x0bff), PROTECT_RDONLY(0x0fc00, 0x1fff),
+			PROTECT_NORDWR(0x18400, 0x1fff), PROTECT_NORDWR(0x1a800, 0x1fff), PROTECT_NORDWR(0x1f400, 0x0443),
+			PROTECT_RDONLY(0x1f844, 0x007b), PROTECT_NORDWR(0x1f887, 0x001b),
+			PROTECT_NORDWR(0x1f8c0, 0x0000),        /* the last: to the end of the registers */
+		};
+		const unsigned last = sizeof(a650_protect) / sizeof(a650_protect[0]) - 1;
+
+		put(&gpu, "cp_protect_cntl", CP_PROTECT_CNTL, CP_PROTECT_CNTL_ON);
+		for (unsigned i = 0; i < last; i++) {
+			wr(gpu.base + CP_PROTECT(i), a650_protect[i]);
+		}
+		wr(gpu.base + CP_PROTECT(CP_PROTECTS - 1), a650_protect[last]);
+		if (!quiet) {
+			say("apollo gpu: %u: %u ranges of the 3D core's registers protected from command buffers (cp_protect)\n", step,
+			    last + 1);
+		}
+	}
 	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, CORE_SQE_ADDRESS);
 	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
 	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
@@ -2569,6 +2648,7 @@ step_frame(void)
 		return false;
 	}
 	announce("make a picture's worth of memory for the 3D core (10 MB) and have it fill three bands of colour");
+	/* (PTE_CORE, not PTE_CORE_OWN: it is the 2D engine that writes it, and its writes are not privileged) */
 	if (!block_new(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, PTE_CORE)) {
 		return false;
 	}
@@ -2724,6 +2804,9 @@ bool apollo_gpu_done(uint32_t fence);
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_ADDRESS_GRANULE     0x10000ull      /* what one allocation is rounded up to */
+/* every address handed out can be mapped: tables for all of them (the last level's 2 MB each, the next's 1 GB, the root) */
+_Static_assert(SPACE_TABLES >= ((GPU_ADDRESSES_START + GPU_ADDRESSES_SIZE) >> 21) + ((GPU_ADDRESSES_START + GPU_ADDRESSES_SIZE) >> 30) + 1,
+    "SPACE_TABLES does not cover GPU_ADDRESSES_START + GPU_ADDRESSES_SIZE");
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
 #define GPU_TIMES_AT            0x400           /* ... and when the core began and ended each of its last submissions */
 #define GPU_TIMES               64
@@ -2758,7 +2841,7 @@ static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does n
 static uint32_t gpu_recover;            /* boot-arg gpu_recover=1: a core that has stopped answering is reset and given work again */
 static uint32_t gpu_recoveries;
 uint32_t apollo_gpu_log;                /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
-uint32_t apollo_gpu_va;                 /* boot-arg gpu_va: 0 the default, 1 describe the addresses */
+uint32_t apollo_gpu_va;                 /* boot-arg gpu_va: 0 the default, 1 describe the addresses, 2 also a granule's guard after each buffer */
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 static struct {
 	uint64_t start, size;
@@ -2954,10 +3037,16 @@ apollo_gpu_mapped(void)
 	space_commit(&core_space);
 }
 
-void
+/*
+ * The pages taken out of the 3D core's space, and the SMMU made to forget what it had of them. false: it has
+ * not said so within 10 ms -- it may still translate the addresses to the old pages, so the caller keeps the
+ * memory the GPU's for good (as it keeps a buffer the core is not done with) and the addresses unused.
+ */
+bool
 apollo_gpu_unmap(uint64_t address, uint64_t size)
 {
 	uint32_t context = smmu_context(&core_space);
+	uint64_t began, patience;
 
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
 		space_map(&core_space, address + offset, 0, 0);
@@ -2965,8 +3054,17 @@ apollo_gpu_unmap(uint64_t address, uint64_t size)
 	space_commit(&core_space);
 	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
 	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
-	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
+	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &patience);
+	began = mach_absolute_time();
+	while (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1) {
+		if (mach_absolute_time() - began >= patience) {
+			say("apollo gpu: THE SMMU DOES NOT FINISH FORGETTING %#llx..%#llx (tlbstatus %#x): the memory stays the GPU's\n",
+			    address, address + size - 1, rd(smmu.base + context + SMMU_CB_TLBSTATUS));
+			return false;
+		}
+		sleep_us(1);
 	}
+	return true;
 }
 
 /* memory that the 3D core and a program see without this processor's cache in between: out of that cache */
@@ -3215,6 +3313,13 @@ uint64_t apollo_gpu_phase[4];           /* the last submission's ticks: waiting 
  * Command buffers for the 3D core to run, in order: each an address and a count of words. As Linux's
  * a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is full and the core is
  * not reading it.
+ *
+ * The caller holds the clients' lock (ApolloGPU's gGPULock) all the while, so a full ring holds up every
+ * other client, and the display's driver's waits, until there is room: that wait is a second at the most
+ * (it was two), the same second after which a wait for a submission takes the core to have stopped
+ * answering (gpuWait()); a ring that is still full after it is taken the same way. Letting go of the lock
+ * while waiting would mean checking the submission's buffers again afterwards (they may have been given
+ * back meanwhile): not done.
  */
 uint32_t
 apollo_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
@@ -3222,7 +3327,7 @@ apollo_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	uint32_t wanted = 26 + 4 * count, room = 0;
 	uint64_t t0 = mach_absolute_time(), t1, t2, t3;
 
-	for (int i = 0; i < 20000; i++) {
+	for (int i = 0; i < 10000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
 			break;
@@ -3447,6 +3552,7 @@ apollo_adreno_init(void)
 	PE_parse_boot_argn("apollo_gpu_keep", &keep, sizeof(keep));
 	PE_parse_boot_argn("apollo_gpu_speed", &speed_index, sizeof(speed_index));
 	PE_parse_boot_argn("apollo_gpu_use", &use, sizeof(use));
+	PE_parse_boot_argn("gpu_protect", &gpu_protect, sizeof(gpu_protect));    /* before step 18 maps the ring */
 	if (last_step > STEPS) {
 		say("apollo gpu: apollo_gpu=%u: there are %u steps so far\n", last_step, STEPS);
 		last_step = STEPS;
