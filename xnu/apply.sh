@@ -5,7 +5,8 @@
 # env:   XNU_URL   where to fetch from (default: Apple's repository on GitHub; an existing clone
 #                  that has the tag will do: XNU_URL=file:///path/to/xnu)
 # The result is a git tree on the branch "hakios" with the work uncommitted, which is how
-# xnu/export.sh expects to find it. A directory that already exists is left alone.
+# xnu/export.sh expects to find it. A directory that already exists is left alone. Each phone's own
+# kernel work (devices/<name>/xnu/) goes on top.
 set -e
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DIR=${1:-${XNU_SRC:-$HERE/../xnu-src/xnu-8796.121.2}}
@@ -27,4 +28,12 @@ git checkout -q -b hakios "$TAG"
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/hakios.patch"
 cp -a "$HERE/files/." .
+# a phone's own kernel work, kept in its directory (devices/<name>/xnu/: a patch for Apple's files, files/ for
+# its drivers), goes on top of the common work; xnu/export.sh puts it back there
+for d in "$HERE"/../devices/*/xnu; do
+	[ -d "$d" ] || continue
+	for p in "$d"/*.patch; do if [ -s "$p" ]; then git apply --whitespace=nowarn "$p"; fi; done
+	if [ -d "$d/files" ]; then cp -a "$d/files/." .; fi
+	echo "apply.sh: + devices/$(basename "$(dirname "$d")")/xnu"
+done
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/hakios.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

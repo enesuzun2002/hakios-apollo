@@ -23,7 +23,9 @@ jobs:
       - name: The kernel patch applies to Apple's tree
         run: |
           git clone -q --depth 1 --branch xnu-8796.121.2 https://github.com/apple-oss-distributions/xnu.git /tmp/xnu
-          git -C /tmp/xnu apply --check "$PWD/xnu/hakios.patch"
+          git -C /tmp/xnu apply "$PWD/xnu/hakios.patch"
+          cp -a xnu/files/. /tmp/xnu/
+          for p in devices/*/xnu/*.patch; do if [ -s "$p" ]; then git -C /tmp/xnu apply --check "$PWD/$p"; fi; done
       - name: APFS tools self-test
         run: |
           [ -x tools/apfs/run-tests.sh ] && tools/apfs/run-tests.sh || echo "no self-test on this runner"
