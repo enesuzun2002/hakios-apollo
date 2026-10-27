@@ -48,7 +48,7 @@ xnu/apply.sh                                 # the kernel tree, with devices/*/x
 devices/mi-10t/tools/mk-ath11k.sh            # the Wi-Fi driver object (runs tools/mk-ath11k.sh first if needed)
 make kernel                                  # links it when it is there
 make loader
-RC_JOBS=../devices/mi-10t/userland/rc.jobs GL=1 make images
+DEVICE=mi-10t RC_JOBS=../devices/mi-10t/userland/rc.jobs GL=1 make images
 devices/mi-10t/run.sh 900                    # the phone in Android or fastboot, on USB
 ```
 

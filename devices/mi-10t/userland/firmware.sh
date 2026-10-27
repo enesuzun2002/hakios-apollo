@@ -1,4 +1,4 @@
-# The Mi 10T's (apollo) firmware into the small image: read by userland/build.sh (in userland/, with root/ the image
+# The Mi 10T's (apollo) firmware into the small image: read by userland/build.sh when DEVICE=mi-10t (in userland/, with root/ the image
 # being made, SHARE set for an image that is going to somebody else). It is the vendor's and never in the repository:
 # devices/mi-10t/pull-firmware.sh takes it off the phone into the ../fw-*-apollo directories, kept apart from the
 # POCO's ../fw-*. Whatever is not there is left out, and said so.
