@@ -36,8 +36,9 @@
  *            events say whether it takes the samples at 48 kHz. The amplifiers stay off.
  *   sound=3  ... and the amplifiers, with the tone playing: set up as Android's driver sets them
  *            up, started once the clock runs, faded in to sound_below eighths of a dB under
- *            Android's own level (default 0 on apollo: the guard and the analog gain at 12 of 18 hold it), faded
- *            out and powered down at the end. Audible.
+ *            Android's own level (default 160 on apollo, 20 dB, as hakios.apollo_cs35l41.c says: there is no
+ *            speaker protection firmware, only the guard and the analog gain at 12 of 18), faded out and powered
+ *            down at the end. Audible.
  *   sound=4  what iOS plays (/dev/hakios-audio, hakios.audio.c), until the run ends: the port
  *            and the stream as above, kept running (silence when iOS writes nothing); the
  *            amplifiers set up once and powered down, started and faded in (the driver's quick
@@ -107,7 +108,8 @@ static LCK_GRP_DECLARE(sound_lock_group, "apollo-sound");
 LCK_MTX_DECLARE(apollo_smmu_lock, &sound_lock_group);       /* (redwood shares its with the Wi-Fi; apollo's is its own) */
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
 
-static uint32_t level, seconds = 3, below = 0,   pause_ms = 1000, gain = APOLLO_GUARD_MAX_GAIN;
+static uint32_t level, seconds = 3, below = 160, pause_ms = 1000, gain = APOLLO_GUARD_MAX_GAIN;
+#define BELOW_MOST              (8 * 102)       /* the most `below' (and below + iOS's volume) means: muted (apollo_cs35l41_volume()) */
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
 static char last_write[96] = "nothing written";
 
@@ -1247,6 +1249,14 @@ guard_off(bool unheard)
 	}
 }
 
+/* sound_below and iOS's volume together, eighths of a dB under Android's level: never wrapped (iOS's part comes from an
+ * ioctl), never past BELOW_MOST */
+static uint32_t
+below_with(uint32_t extra)
+{
+	return extra >= BELOW_MOST || below + extra >= BELOW_MOST ? BELOW_MOST : below + extra;
+}
+
 /*
  * The amplifiers on while there is sound, at the volume iOS has set (apollo_audio_volume(): how
  * far under the loudest, sound_below under Android's level), and off while iOS's volume is 0;
@@ -1275,25 +1285,29 @@ watch(void)
 			    muted ? "muted (0), " : "", extra / 8, extra % 8 * 125, below / 8, below % 8 * 125,
 			    on ? (muted ? ": the amplifiers are stopped" : ": the amplifiers follow") : "");
 			if (muted) {
-				guard_off(true);
 				if (on) {
 					apollo_cs35l41_stop();
 					on = false;
 				}
-			} else if (on && !apollo_cs35l41_volume(below + extra, 1)) {
+				guard_off(true);
+			} else if (on && !apollo_cs35l41_volume(below_with(extra), 1)) {
+				/* at a level not known: powered down before the guard is told nothing is heard */
+				say("apollo sound: THE AMPLIFIERS' VOLUME COULD NOT BE SET: they are powered down and given up on\n");
+				apollo_cs35l41_stop();
 				guard_off(true);
 				on = false;
 				given_up = true;
 			} else if (!given_up) {
-				guard_level(below + extra);
+				guard_level(below_with(extra));
 			}
 		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
 			ios_peak = 0;
-			if (!apollo_cs35l41_start() || !apollo_cs35l41_volume(below + extra, 1)) {
+			if (!apollo_cs35l41_start() || !apollo_cs35l41_volume(below_with(extra), 1)) {
 				say("apollo sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
+				apollo_cs35l41_stop();          /* (any of them that did power up: not left on with the guard off) */
 				guard_off(true);
 				given_up = true;
 			} else {
@@ -1335,6 +1349,11 @@ watch(void)
 			}
 		}
 		sleep_ms(5);
+	}
+	/* (take_down() stops them too, but only after waiting 3 s for this: if the watcher outlived that, what it started is
+	 * stopped here; the amplifiers' calls are serialized in hakios.apollo_cs35l41.c) */
+	if (on) {
+		apollo_cs35l41_stop();
 	}
 	guard_off(true);
 	say("apollo sound: the watcher stops; the amplifiers were started %u times, iOS set the volume %u times%s\n", starts, changes,
@@ -1493,6 +1512,9 @@ apollo_sound_dsp_up(void)
 	}
 	PE_parse_boot_argn("apollo_sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("apollo_sound_below", &below, sizeof(below));
+	if (below > BELOW_MOST) {
+		below = BELOW_MOST;
+	}
 	PE_parse_boot_argn("apollo_sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("apollo_sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("apollo_sound_gain", &gain, sizeof(gain));

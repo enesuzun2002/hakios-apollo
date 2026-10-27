@@ -25,10 +25,12 @@
  *      takes int16 mono 48 kHz samples as /dev/hakios-haptic does; a waveform of iOS's (a stretch of samples after
  *      a pause) is a tap (waveform 1), one that goes on for longer than a tap the looping waveform (11) until it
  *      ends -- HAPTIC_MAX_MS at most, then the motor rests as long. The gain follows the loudness (gain_for()).
+ *      Taps and vibrations together drive the motor HAPTIC_MAX_MS at most in any DUTY_WINDOW_MS (2 s): past that
+ *      it is stopped and rests HAPTIC_MAX_MS, and nothing starts until the window has room again.
  *
  * Limits, whatever asks: Android's own values only (gain 0x80 at the most, its boost settings, its waveforms); no
- * effect longer than HAPTIC_MAX_MS; any fault the chip reports (boost short circuit or over-voltage, under-voltage,
- * over-current, over-temperature), a byte nobody acknowledges or a RAM that does not read back, and the chip is put
+ * effect longer than HAPTIC_MAX_MS, no more than HAPTIC_MAX_MS of driving in any DUTY_WINDOW_MS; any fault the chip
+ * reports (boost short circuit or over-voltage, under-voltage, over-current, over-temperature), a byte nobody acknowledges or a RAM that does not read back, and the chip is put
  * into reset for the rest of the run. At the run's end and on a panic's way out the chip goes back into reset.
  *
  * Taken from Android's driver (aw8697.c, apollo-q-oss), function by function:
@@ -265,7 +267,7 @@ branch_on(uint32_t cbcr)
 static int
 bus_clocks_on(void)
 {
-	wr(gcc + GCC_VOTE, rd(gcc + GCC_VOTE) | VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);
+	apollo_gcc_vote(gcc + GCC_VOTE, VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);    /* (locked: shared register) */
 	for (int i = 0; i < 1000; i++) {
 		if (branch_on(QUP1_CORE_2X_CBCR) && branch_on(QUP1_CORE_CBCR) && branch_on(QUP1_M_AHB_CBCR) && branch_on(QUP1_S_AHB_CBCR)) {
 			return 0;
@@ -308,7 +310,7 @@ se_clock_on(uint32_t *select)
 			return -1;
 		}
 	}
-	wr(gcc + GCC_VOTE, rd(gcc + GCC_VOTE) | VOTE_QUP1_S3);
+	apollo_gcc_vote(gcc + GCC_VOTE, VOTE_QUP1_S3);
 	for (int i = 0; i < 1000; i++) {
 		if (branch_on(QUP1_S3_CBCR)) {
 			return 0;
@@ -548,6 +550,9 @@ regs_write(uint8_t reg, const uint8_t *values, unsigned count)
 
 #define SYSINT_FAULTS           0xe6
 #define HAPTIC_MAX_MS           1000
+#define DUTY_WINDOW_MS          2000            /* at most HAPTIC_MAX_MS of driving (taps and vibrations) in any window this long */
+#define DUTY_SLOT_MS            100             /* the window kept as so many slots of driving time; one more than it takes, so */
+#define DUTY_SLOTS              (DUTY_WINDOW_MS / DUTY_SLOT_MS + 1)     /* that the slots always cover the whole window */
 #define ANDROID_GAIN            0x80            /* aw8697_haptic_effect_strength(): the strongest level */
 #define BST_VOL_RAM             0x11            /* DT vib_bst_vol_ram */
 
@@ -859,11 +864,12 @@ out:
 static bool
 halt(void)
 {
-	if (!regs_write(AW_GO, (const uint8_t[]){ 0 }, 1) || !wait_standby(200)) {
-		give_up("it does not stop");
+	/* (one that cannot be told -- given up on already, or not answering -- is stopped by its reset line instead) */
+	if (broken || !regs_write(AW_GO, (const uint8_t[]){ 0 }, 1) || !wait_standby(200)) {
+		give_up(broken ? "it cannot be told to stop" : "it does not stop");
 		return false;
 	}
-	return to_standby();
+	return to_standby();            /* (a failure there has put it into reset already: put(), upd()) */
 }
 
 /* A waveform started without waiting for it: once, or (`forever') repeated until halted. */
@@ -880,7 +886,7 @@ start_waveform(unsigned waveform, bool forever, uint8_t gain)
 		say("apollo haptic: THE SERIAL ENGINE'S CLOCKS ARE OFF before a waveform (core_2x %#x core %#x m_ahb %#x s_ahb %#x s3 %#x, vote "
 		    "%#x): the engine is not touched\n", rd(gcc + QUP1_CORE_2X_CBCR), rd(gcc + QUP1_CORE_CBCR), rd(gcc + QUP1_M_AHB_CBCR),
 		    rd(gcc + QUP1_S_AHB_CBCR), rd(gcc + QUP1_S3_CBCR), rd(gcc + GCC_VOTE));
-		broken = true;
+		give_up("the serial engine's clocks are off");  /* (the reset line only: the engine is not touched) */
 		return false;
 	}
 	{
@@ -1036,6 +1042,9 @@ serve(void)
 	uint64_t since = 0, rest_until = 0, last_look = 0, tap_onset = 0, followed = 0;
 	uint8_t playing_gain = 0;
 	unsigned follows = 0;                   /* how often the vibration playing now has changed strength */
+	uint32_t driven[DUTY_SLOTS] = { 0 };    /* us the motor was driven (a tap or a vibration under way) per DUTY_SLOT_MS */
+	uint64_t duty_slot = now_us() / (DUTY_SLOT_MS * 1000), duty_last = now_us();
+	unsigned duty_cuts = 0;
 	int major = cdevsw_add(-1, &haptic_cdevsw);
 
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "apollo-haptic") == NULL) {
@@ -1048,6 +1057,41 @@ serve(void)
 		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
 		uint32_t peak = heard_peak;
 		uint8_t gain = gain_for(peak);
+		uint64_t slot = now / (DUTY_SLOT_MS * 1000), window = 0;
+
+		/*
+		 * The duty budget, across taps and vibrations alike: the time since the last look counts as driving if a tap or a
+		 * vibration was under way (a tap's whole TAP state, more than its waveform: on the safe side); the slots older
+		 * than the window are emptied. Over HAPTIC_MAX_MS in the window: stopped, a rest of HAPTIC_MAX_MS, and nothing
+		 * starts again until the window has room (a single cap per vibration does not stop a stream of short taps).
+		 */
+		for (uint64_t s = duty_slot + 1; s <= slot && s <= duty_slot + DUTY_SLOTS; s++) {
+			driven[s % DUTY_SLOTS] = 0;
+		}
+		duty_slot = slot;
+		if (state == TAP || state == LOOP) {
+			uint64_t spent = now - duty_last;
+
+			driven[slot % DUTY_SLOTS] += spent > DUTY_WINDOW_MS * 1000ull ? DUTY_WINDOW_MS * 1000u : (uint32_t)spent;
+		}
+		duty_last = now;
+		for (unsigned i = 0; i < DUTY_SLOTS; i++) {
+			window += driven[i];
+		}
+		if ((state == TAP || state == LOOP) && window >= HAPTIC_MAX_MS * 1000ull) {
+			if (!halt()) {
+				break;
+			}
+			capped++;
+			rest_until = now + HAPTIC_MAX_MS * 1000ull;
+			if (duty_cuts++ < TOLD_EVENTS) {
+				say("apollo haptic: %llu ms of driving in the last %u ms: the motor is STOPPED and rests %u ms (%u taps, %u "
+				    "vibrations so far)\n", window / 1000, DUTY_WINDOW_MS, HAPTIC_MAX_MS, taps, loops);
+			}
+			state = REST;
+			wait_ms(4);
+			continue;
+		}
 
 		switch (state) {
 		case IDLE:
@@ -1060,6 +1104,10 @@ serve(void)
 			if (active && onset_us != tap_onset && now - onset_us >= SETTLE_US) {
 				uint64_t began = onset_us;
 
+				if (window >= HAPTIC_MAX_MS * 1000ull) {
+					tap_onset = began;      /* (no room in the duty window: this tap is left out, not played late) */
+					break;
+				}
 				if (state == TAP && !wait_standby(0) && !halt()) {
 					break;
 				}
@@ -1130,7 +1178,7 @@ serve(void)
 			}
 			break;
 		case REST:
-			if (now >= rest_until) {
+			if (now >= rest_until) {        /* (and what starts next waits for room in the duty window) */
 				state = IDLE;
 			}
 			break;

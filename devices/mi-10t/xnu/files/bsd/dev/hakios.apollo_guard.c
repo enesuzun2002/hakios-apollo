@@ -1,7 +1,10 @@
 /*
  * The Xiaomi Mi 10T's (apollo) speakers' guard: a copy of bsd/dev/hakios.guard.c, kept apart from it so that its
  * limits can follow apollo's CS35L41s (bsd/dev/hakios.apollo_cs35l41.c) rather than redwood's Awinic amplifiers. As yet the
- * numbers are redwood's: they assume Android's level, which apollo's amplifiers stay well under (hakios.apollo_sound.c).
+ * numbers are redwood's: they are reckoned at Android's digital level. By default apollo's amplifiers play 20 dB under it
+ * (apollo_sound_below, default 160) with their analog gain at 12 of Android's 18; apollo_sound_below=0 brings the digital
+ * level up to Android's, and then only these limits -- not Cirrus's protection firmware, which does not run -- stand
+ * between the samples and the speakers (hakios.apollo_sound.c).
  */
 /*
  * The speakers' guard: what the samples go through on their way to the phone's two amplifiers
@@ -31,8 +34,9 @@
  *   peaks      no sample above 3 dB under full scale at Android's level: a limiter that turns
  *              the level down at the sample that would go over (so none does) and lets it come
  *              back with a time constant of 43 ms
- *   monitor    a further reduction that the amplifiers' watch asks for (hakios.speaker.c:
- *              Android's table for a cold amplifier, and a low battery)
+ *   monitor    a further reduction that the amplifiers' watch asks for (on apollo
+ *              hakios.apollo_cs35l41.c's apollo_cs35l41_monitor(): 6 dB for the rest of the run
+ *              once either amplifier has raised its temperature warning, TEMP_WARN)
  *
  * Before all that, a gain (sound_gain, at most 12 dB): iOS's own processing for the iPhone X's
  * speaker keeps even a full-scale tone at its top volume 12.6 to 14.3 dB under full scale, so
@@ -162,7 +166,9 @@ block(int16_t *frames, uint32_t count)
 {
 	uint32_t attenuation = guard.attenuation;
 	struct apollo_guard_report *r = &guard.report;
-	uint64_t to_speaker = attenuation == APOLLO_GUARD_SILENT ? 0 : amplitude(2 * attenuation);
+	/* (the power's attenuation is twice the amplitude's: kept from wrapping, which would make a quiet level a loud one) */
+	uint64_t to_speaker = attenuation == APOLLO_GUARD_SILENT ? 0 :
+	    amplitude(attenuation > UINT32_MAX / 2 ? UINT32_MAX : 2 * attenuation);
 	uint64_t sum[2] = { 0, 0 }, g2 = ONE, g, start = guard.level, ceiling;
 	uint32_t binding = 0;
 

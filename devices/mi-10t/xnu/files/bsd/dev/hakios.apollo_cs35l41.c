@@ -21,6 +21,7 @@
  * I2C through the serial engine as Linux's i2c-qcom-geni.c drives it: FIFO mode, polled, 400 kHz.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
@@ -139,7 +140,7 @@ clocks_on(uint32_t *select)
 {
 	uint32_t s_ahb;
 
-	wr(gcc + GCC_VOTE, rd(gcc + GCC_VOTE) | VOTE_QUP0 | VOTE_QUP0_SE3);
+	apollo_gcc_vote(gcc + GCC_VOTE, VOTE_QUP0 | VOTE_QUP0_SE3);    /* (locked: the other drivers vote in the same register) */
 	*select = 0;
 	if (rd(gcc + QUP0_SE3_RCG + 0x14) & 1) {
 		int found = -1;
@@ -409,6 +410,9 @@ reg_update(uint8_t amp, uint32_t reg, uint32_t mask, uint32_t value)
 #define PUP_DONE                0x01000000
 #define PDN_DONE                0x00800000
 #define IRQ1_ERRORS             (0x80000000u | 0x00020000u | 0x00000040u | 0x00000080u | 0x00000100u)   /* short, temp, boost */
+#define IRQ1_TEMP_WARN          0x00008000u     /* CS35L41_TEMP_WARN (include/sound/cs35l41.h): not a fault, a level cut (monitor) */
+#define READ_FAILURES_MOST      3               /* IRQ1_STATUS1 unreadable so many looks in a row: unhealthy */
+#define TEMP_WARN_CUT           (6 * 8)         /* eighths of a dB the guard takes off once TEMP_WARN has been seen */
 #define VOL_MUTE                0x4cfu
 #define GAIN                    12              /* of Android's 18 */
 
@@ -468,6 +472,16 @@ static const struct {
 
 static bool amp_used[2], amp_ready[2], amp_on[2];
 static bool prepared;
+static uint32_t read_failures[2];       /* IRQ1_STATUS1 reads that failed in a row (apollo_cs35l41_healthy()) */
+static bool temp_warned;                /* TEMP_WARN seen at some point of the run: the level stays cut for the rest of it */
+/*
+ * The public entry points that use I2C hold this: the sound's watcher may be in the middle of a sequence (a fade, a
+ * power-down) when the run's end stops the amplifiers from another thread. Not apollo_cs35l41_quiesce(): a panic's
+ * way out takes no lock (it only drops the reset line).
+ */
+static LCK_GRP_DECLARE(amps_lock_group, "apollo-cs35l41");
+static LCK_MTX_DECLARE(amps_lock, &amps_lock_group);
+static void amps_stop(void);
 /* the digital volume last written, eighths of a dB under 0 dB; 8 * 102: muted. Muted again whenever they power down
  * or up: a start after a stop must write its level, not find it "already set" (that left them muted, heard on the phone) */
 static uint32_t volume_at = 8 * 102;
@@ -616,7 +630,9 @@ amp_setup(unsigned a)
  *      (bit clock running, amplifier not yet powered up) the heartbeat is checked, the core restarted once if it does not count;
  *      after power-up the mailbox gets RESUME (PAUSE at stop). Healthy or not, the audio stays PCM (DAC_PCM1_SRC = ASPRX1).
  *   =3 (stage 4): as 2, and at the playback start the DAC is fed from the DSP (DAC_PCM1_SRC = DSPTX1, DSP RX1/RX2 = ASPRX1,
- *      DRE on); at stop the DAC goes back to ASPRX1.
+ *      DRE on); at stop the DAC goes back to ASPRX1. Only at the rate the tuning was made for (Android's 96 kHz: AMP_RATE_HZ
+ *      must equal DSP_TUNING_RATE_HZ) and only for an amplifier whose calibration took; otherwise it runs as 2 (said in the log):
+ *      the protection algorithm fed at the wrong rate or with the wrong impedance would protect nothing it claims to.
  * On any failure (loading, no heartbeat at playback, no RESUME) the cores are stopped and both amplifiers are reset and set up
  * again as before this existed.
  *
@@ -692,6 +708,8 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define DSP_XM_PACKED           0x02000000u
 #define DSP_YM_PACKED           0x02c00000u
 #define DSP_PM_PACKED           0x03800000u
+#define AMP_RATE_HZ             48000u          /* what this runs the amplifiers at (GLOBAL_FS 3) */
+#define DSP_TUNING_RATE_HZ      96000u          /* what the .bin tuning is for: Android's rate (GLOBAL_FS 4) */
 #define FW_ID_HALO_CSPL         0x400a4u        /* the firmware's own id (XM header) */
 #define ALG_ID_CSPL             0xcdu           /* the speaker protection algorithm */
 #define ALG_CSPL_XM_BASE        0x94u           /* what Android's log shows for it: "XM@94 YM@e" */
@@ -718,7 +736,7 @@ static uint32_t dsp_level;                      /* apollo_amps_dsp */
 static struct dsp_info dsp_info[2];
 /* The firmware's controls (from the .wmfw's algorithm data), kept for the playback start; valid = loaded and the core started */
 static struct {
-	bool valid, routed, feedback;
+	bool valid, routed, feedback, calibrated;
 	uint32_t cal_r, cal_status, cal_checksum;
 	uint32_t halo_state, heartbeat, enable, command, state, errorno, temperature;
 } dsp_ctl[2];
@@ -1603,8 +1621,8 @@ map_all(void)
 	return pin_reset && pins_i2c && gcc && se;
 }
 
-bool
-apollo_cs35l41_prepare(__unused const uint8_t *config, __unused uint64_t size)
+static bool
+amps_prepare(void)
 {
 	uint32_t which = 3, select = 0;
 	const char *problem;
@@ -1613,6 +1631,11 @@ apollo_cs35l41_prepare(__unused const uint8_t *config, __unused uint64_t size)
 	PE_parse_boot_argn("apollo_amps", &which, sizeof(which));
 	dsp_level = 0;
 	PE_parse_boot_argn("apollo_amps_dsp", &dsp_level, sizeof(dsp_level));
+	if (dsp_level >= 3 && AMP_RATE_HZ != DSP_TUNING_RATE_HZ) {
+		say("apollo cs35l41: apollo_amps_dsp=%u REFUSED: the tuning is for %u Hz and this runs %u Hz; stage 2 instead (the firmware "
+		    "loaded and run, the audio PCM)\n", dsp_level, DSP_TUNING_RATE_HZ, AMP_RATE_HZ);
+		dsp_level = 2;
+	}
 	amp_used[0] = (which & 1) != 0;
 	amp_used[1] = (which & 2) != 0;
 	if (!map_all()) {
@@ -1648,8 +1671,8 @@ apollo_cs35l41_prepare(__unused const uint8_t *config, __unused uint64_t size)
 }
 
 /* Powered up (the clock runs: hakios.apollo_sound.c has started the port), unmuted only by apollo_cs35l41_volume() */
-bool
-apollo_cs35l41_start(void)
+static bool
+amps_start(void)
 {
 	bool any = false, dsp_failed = false;
 
@@ -1685,6 +1708,7 @@ apollo_cs35l41_start(void)
 		}
 		amp_on[a] = true;
 		any = true;
+		read_failures[a] = 0;
 		volume_at = 8 * 102;            /* (powered up muted) */
 		say("apollo cs35l41: %s: POWERED UP, muted\n", amps[a].name);
 	}
@@ -1710,13 +1734,17 @@ apollo_cs35l41_start(void)
 			dsp_failed = true;
 		} else if (!dsp_playback_check(a)) {
 			dsp_failed = true;
-		} else if (dsp_level >= 3 && !dsp_calibrate(a)) {
+		} else if (dsp_level >= 3 && (dsp_ctl[a].cal_r == 0 || !dsp_calibrate(a))) {
 			/*
 			 * Not a failure: written before RESUME the values read back as zeros (25 October), so they are tried with the
-			 * firmware running; without them it uses its tuning's default impedance, and the guard stays on.
+			 * firmware running. But the DAC is not given the firmware's output without them (stage 2 for this amplifier):
+			 * its tuning's default impedance is not this speaker's.
 			 */
-			say("apollo cs35l41: %s: the calibration did not take (the firmware runs with its default): going on\n", amps[a].name);
+			dsp_ctl[a].calibrated = false;
+			say("apollo cs35l41: %s: the calibration did not take: the audio stays PCM (stage 2), the firmware not routed\n",
+			    amps[a].name);
 		} else {
+			dsp_ctl[a].calibrated = dsp_level >= 3;
 			dsp_report(a, "after RESUME, heartbeat counting");
 		}
 	}
@@ -1724,6 +1752,11 @@ apollo_cs35l41_start(void)
 		uint8_t amp = amps[a].address;
 
 		if (!amp_on[a] || !dsp_ctl[a].valid || dsp_ctl[a].routed) {
+			continue;
+		}
+		if (AMP_RATE_HZ != DSP_TUNING_RATE_HZ || !dsp_ctl[a].calibrated) {
+			say("apollo cs35l41: %s: NOT routed through the firmware (%s): PCM, as stage 2\n", amps[a].name,
+			    AMP_RATE_HZ != DSP_TUNING_RATE_HZ ? "not at the tuning's rate" : "not calibrated");
 			continue;
 		}
 		/* Android's "speaker" path (mixer_paths_overlay_static.xml): PCM Source DSP, DSP RX1 and RX2 from ASPRX1 (the channel's own
@@ -1749,16 +1782,16 @@ apollo_cs35l41_start(void)
 			}
 		}
 		say("apollo cs35l41: THE FIRMWARE IS NOT HEALTHY (PLL, heartbeat, RESUME or routing): amplifiers powered down, reset, plain PCM\n");
-		apollo_cs35l41_stop();
+		amps_stop();
 		dsp_failsafe();
-		return apollo_cs35l41_start();          /* (dsp_level is 0 now: no second pass through this) */
+		return amps_start();                    /* (dsp_level is 0 now: no second pass through this) */
 	}
 	return any;
 }
 
 /* `below` eighths of a dB under Android's level (0 dB of digital volume): stepped there, 6 dB a step, step_ms apart */
-bool
-apollo_cs35l41_volume(uint32_t below, uint32_t step_ms)
+static bool
+amps_volume(uint32_t below, uint32_t step_ms)
 {
 	uint32_t at = volume_at;
 	bool ok = true;
@@ -1783,25 +1816,47 @@ apollo_cs35l41_volume(uint32_t below, uint32_t step_ms)
 	return ok;
 }
 
-/* No fault reported (an amplifier's short, its temperature, its boost); on one, both are powered down */
-bool
-apollo_cs35l41_healthy(void)
+/*
+ * No fault reported (an amplifier's short, its temperature, its boost); on one, both are powered down. A status that
+ * cannot be read is not taken for a healthy one: READ_FAILURES_MOST failed reads in a row, and both are powered down too
+ * (a bus that stopped answering would otherwise hide every fault while they play). TEMP_WARN is noted for the monitor.
+ */
+static bool
+amps_healthy(void)
 {
 	for (unsigned a = 0; a < 2; a++) {
 		uint32_t status = 0;
 
-		if (amp_on[a] && reg_read(amps[a].address, REG_IRQ1_STATUS1, &status) && (status & IRQ1_ERRORS)) {
+		if (!amp_on[a]) {
+			continue;
+		}
+		if (!reg_read(amps[a].address, REG_IRQ1_STATUS1, &status)) {
+			if (++read_failures[a] >= READ_FAILURES_MOST) {
+				say("apollo cs35l41: %s: ITS STATUS CANNOT BE READ (%u times in a row): both powered down\n", amps[a].name,
+				    read_failures[a]);
+				amps_stop();
+				return false;
+			}
+			continue;
+		}
+		read_failures[a] = 0;
+		if (status & IRQ1_ERRORS) {
 			say("apollo cs35l41: %s REPORTS A FAULT (%#x): both powered down\n", amps[a].name, status);
-			apollo_cs35l41_stop();
+			amps_stop();
 			return false;
+		}
+		if ((status & IRQ1_TEMP_WARN) && !temp_warned) {
+			temp_warned = true;
+			say("apollo cs35l41: %s WARNS OF ITS TEMPERATURE (%#x): the level is cut by %u.%03u dB for the rest of the run\n",
+			    amps[a].name, status, TEMP_WARN_CUT / 8, TEMP_WARN_CUT % 8 * 125);
 		}
 	}
 	return true;
 }
 
 /* Muted, powered down (cs35l41_global_enable(0), the power-down patch) */
-void
-apollo_cs35l41_stop(void)
+static void
+amps_stop(void)
 {
 	for (unsigned a = 0; a < 2; a++) {
 		uint8_t amp = amps[a].address;
@@ -1851,8 +1906,91 @@ apollo_cs35l41_quiesce(void)
 	}
 }
 
-uint32_t
-apollo_cs35l41_monitor(__unused bool tell)
+/*
+ * The further reduction the guard is to make (eighths of a dB): TEMP_WARN (IRQ1_STATUS1 bit 15, latched, never cleared
+ * here), once either amplifier has shown it, holds the level TEMP_WARN_CUT down for the rest of the run -- Android's
+ * protection firmware would turn it down by itself; this has no measure of how far, so it stays cut. Nothing else yet
+ * (Android's cold-amplifier and battery tables are not carried over).
+ */
+static uint32_t
+amps_monitor(bool tell)
 {
-	return 0;
+	for (unsigned a = 0; a < 2 && !temp_warned; a++) {
+		uint32_t status = 0;
+
+		if (amp_on[a] && reg_read(amps[a].address, REG_IRQ1_STATUS1, &status) && (status & IRQ1_TEMP_WARN)) {
+			temp_warned = true;
+			say("apollo cs35l41: %s WARNS OF ITS TEMPERATURE (%#x): the level is cut by %u.%03u dB for the rest of the run\n",
+			    amps[a].name, status, TEMP_WARN_CUT / 8, TEMP_WARN_CUT % 8 * 125);
+		}
+	}
+	if (tell && temp_warned) {
+		say("apollo cs35l41: the temperature warning holds the level %u.%03u dB down\n", TEMP_WARN_CUT / 8, TEMP_WARN_CUT % 8 * 125);
+	}
+	return temp_warned ? TEMP_WARN_CUT : 0;
+}
+
+/* ---- the entry points (hakios.apollo_sound.c): one at a time, under amps_lock ------------------------------------- */
+
+bool
+apollo_cs35l41_prepare(__unused const uint8_t *config, __unused uint64_t size)
+{
+	bool ok;
+
+	lck_mtx_lock(&amps_lock);
+	ok = amps_prepare();
+	lck_mtx_unlock(&amps_lock);
+	return ok;
+}
+
+bool
+apollo_cs35l41_start(void)
+{
+	bool ok;
+
+	lck_mtx_lock(&amps_lock);
+	ok = amps_start();
+	lck_mtx_unlock(&amps_lock);
+	return ok;
+}
+
+bool
+apollo_cs35l41_volume(uint32_t below, uint32_t step_ms)
+{
+	bool ok;
+
+	lck_mtx_lock(&amps_lock);
+	ok = amps_volume(below, step_ms);
+	lck_mtx_unlock(&amps_lock);
+	return ok;
+}
+
+bool
+apollo_cs35l41_healthy(void)
+{
+	bool ok;
+
+	lck_mtx_lock(&amps_lock);
+	ok = amps_healthy();
+	lck_mtx_unlock(&amps_lock);
+	return ok;
+}
+
+void
+apollo_cs35l41_stop(void)
+{
+	lck_mtx_lock(&amps_lock);
+	amps_stop();
+	lck_mtx_unlock(&amps_lock);
+}
+
+uint32_t
+apollo_cs35l41_monitor(bool tell)
+{
+	uint32_t below;
+
+	lck_mtx_lock(&amps_lock);
+	below = amps_monitor(tell);
+	lck_mtx_unlock(&amps_lock);
+	return below;
 }
