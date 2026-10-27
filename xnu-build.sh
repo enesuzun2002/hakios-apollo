@@ -8,6 +8,11 @@ LX=$XNUDEPS/build/ath11k/out/ath11k.o
 STAMP=BUILD/obj/hakios-objects
 mtime() { if [ "$XNU_HOST_OS" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
 if [ -f "$LX" ]; then now="$LX $(mtime "$LX")"; else LX= now=; fi
+# a phone's own copy of it, under names of its own (devices/<name>/tools/mk-ath11k.sh: xnu-deps/build/ath11k-<name>),
+# linked beside it
+for o in "$XNUDEPS"/build/ath11k-*/out/ath11k-*.o; do
+	if [ -f "$o" ]; then LX="$LX $o"; now="$now $o $(mtime "$o")"; fi
+done
 # the build tools of SETUP/ are Apple's: on macOS they build as they are, on Linux with a compatibility header
 if [ "$XNU_HOST_OS" = Darwin ]; then HOSTCC=clang; else
 HOSTCC="clang -include $XNUDEPS/hostinc/hostcompat.h -I$XNUDEPS/hostinc -Wno-unused-command-line-argument -Wno-error=implicit-function-declaration"; fi

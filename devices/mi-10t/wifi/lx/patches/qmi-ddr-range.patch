@@ -1,0 +1,112 @@
+--- qmi.c
++++ qmi.c
+@@ -31,6 +31,32 @@
+ MODULE_PARM_DESC(cold_boot_cal,
+ 		 "Decrease the channel switch time but increase the driver load time (Default: true)");
+ 
++static const struct qmi_elem_info qmi_wlanfw_host_ddr_range_s_v01_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u64),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0,
++		.offset		= offsetof(struct qmi_wlanfw_host_ddr_range_s_v01, start),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u64),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0,
++		.offset		= offsetof(struct qmi_wlanfw_host_ddr_range_s_v01, size),
++	},
++	{
++		.data_type	= QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type	= QMI_COMMON_TLV_TYPE,
++	},
++};
++
++unsigned lx_os_option(const char *name);
++
+ static const struct qmi_elem_info qmi_wlanfw_host_cap_req_msg_v01_ei[] = {
+ 	{
+ 		.data_type	= QMI_OPT_FLAG,
+@@ -275,6 +301,26 @@
+ 		.offset		= offsetof(struct qmi_wlanfw_host_cap_req_msg_v01,
+ 					   mem_cfg_mode),
+ 	},
++	/* apollo: Xiaomi apollo-q-oss wlan_firmware_service_v01.c:2608-2625 (tlv 0x1F, static array of 3) */
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x1F,
++		.offset		= offsetof(struct qmi_wlanfw_host_cap_req_msg_v01,
++					   ddr_range_valid),
++	},
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= QMI_WLFW_MAX_HOST_DDR_RANGE_SIZE_V01,
++		.elem_size	= sizeof(struct qmi_wlanfw_host_ddr_range_s_v01),
++		.array_type	= STATIC_ARRAY,
++		.tlv_type	= 0x1F,
++		.offset		= offsetof(struct qmi_wlanfw_host_cap_req_msg_v01,
++					   ddr_range),
++		.ei_array	= qmi_wlanfw_host_ddr_range_s_v01_ei,
++	},
+ 	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+@@ -1725,6 +1771,14 @@
+ 	req.bdf_support_valid = 1;
+ 	req.bdf_support = 1;
+ 
++	/* apollo: what cnss2 sends (cnss_wlfw_host_cap_send_sync): the IOVA window the firmware may use, 0xa0000000 + 0x10000000
++	 * (qcom,iommu-dma-addr-pool) + 0x10000 (smmu_iova_ipa at 0xb0000000), as one range; boot-arg wifi_ddr_range=0 leaves it out */
++	if (lx_os_option("wifi_ddr_range")) {
++		req.ddr_range_valid = 1;
++		req.ddr_range[0].start = 0xa0000000ULL;
++		req.ddr_range[0].size = 0x10010000ULL;
++	}
++
+ 	if (ab->hw_params.m3_fw_support) {
+ 		req.m3_support_valid = 1;
+ 		req.m3_support = 1;
+--- qmi.h
++++ qmi.h
+@@ -147,7 +147,7 @@
+ 	wait_queue_head_t cold_boot_waitq;
+ };
+ 
+-#define QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN		261
++#define QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN		316
+ #define QMI_WLANFW_HOST_CAP_REQ_V01			0x0034
+ #define QMI_WLANFW_HOST_CAP_RESP_MSG_V01_MAX_LEN	7
+ #define QMI_WLFW_HOST_CAP_RESP_V01			0x0034
+@@ -159,6 +159,13 @@
+ #define CALDB_MEM_REGION_TYPE				0x4
+ #define PAGEABLE_MEM_REGION_TYPE			0x9
+ 
++#define QMI_WLFW_MAX_HOST_DDR_RANGE_SIZE_V01		3
++
++struct qmi_wlanfw_host_ddr_range_s_v01 {
++	u64 start;
++	u64 size;
++};
++
+ struct qmi_wlanfw_host_cap_req_msg_v01 {
+ 	u8 num_clients_valid;
+ 	u32 num_clients;
+@@ -187,6 +194,9 @@
+ 	u32 mem_bucket;
+ 	u8 mem_cfg_mode_valid;
+ 	u8 mem_cfg_mode;
++	/* apollo: cnss2's wlfw_host_cap_req_msg_v01 ddr_range (Xiaomi apollo-q-oss wlan_firmware_service_v01.h:675) */
++	u8 ddr_range_valid;
++	struct qmi_wlanfw_host_ddr_range_s_v01 ddr_range[QMI_WLFW_MAX_HOST_DDR_RANGE_SIZE_V01];
+ };
+ 
+ struct qmi_wlanfw_host_cap_resp_msg_v01 {

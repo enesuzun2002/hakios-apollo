@@ -1,0 +1,51 @@
+--- qmi.c
++++ qmi.c
+@@ -2031,6 +2031,24 @@
+ 	}
+ }
+ 
++/*
++ * apollo: the firmware's memory on round boundaries, as Android's cnss2 hands it out on the Mi 10T (its log: HOST_DDR at
++ * 0xa1000000, the type 4 chunk at 0xa1600000, M3 at 0xa1880000) -- the lx pool otherwise aligns to 64 bytes only.
++ * More is taken than asked for and the start moved up to the boundary (the pool's rings are never given back).
++ */
++static void *apollo_dma_alloc_aligned(struct device *dev, size_t size, dma_addr_t *paddr, size_t align)
++{
++	dma_addr_t raw;
++	void *vaddr = dma_alloc_coherent(dev, size + align, &raw, GFP_KERNEL | __GFP_NOWARN);
++	size_t skip;
++
++	if (!vaddr)
++		return NULL;
++	skip = (size_t)((align - (raw & (align - 1))) & (align - 1));
++	*paddr = raw + skip;
++	return (u8 *)vaddr + skip;
++}
++
+ static int ath11k_qmi_alloc_target_mem_chunk(struct ath11k_base *ab)
+ {
+ 	int i;
+@@ -2064,10 +2082,8 @@
+ 			chunk->vaddr = NULL;
+ 		}
+ 
+-		chunk->vaddr = dma_alloc_coherent(ab->dev,
+-						  chunk->size,
+-						  &chunk->paddr,
+-						  GFP_KERNEL | __GFP_NOWARN);
++		chunk->vaddr = apollo_dma_alloc_aligned(ab->dev, chunk->size, &chunk->paddr,
++							chunk->size >= SZ_2M ? SZ_2M : SZ_512K);
+ 		if (!chunk->vaddr) {
+ 			if (ab->qmi.mem_seg_count <= ATH11K_QMI_FW_MEM_REQ_SEGMENT_CNT) {
+ 				ath11k_dbg(ab, ATH11K_DBG_QMI,
+@@ -2597,9 +2613,7 @@
+ 		m3_len = fw->size;
+ 	}
+ 
+-	m3_mem->vaddr = dma_alloc_coherent(ab->dev,
+-					   m3_len, &m3_mem->paddr,
+-					   GFP_KERNEL);
++	m3_mem->vaddr = apollo_dma_alloc_aligned(ab->dev, m3_len, &m3_mem->paddr, SZ_512K);
+ 	if (!m3_mem->vaddr) {
+ 		ath11k_err(ab, "failed to allocate memory for M3 with size %zu\n",
+ 			   m3_len);

@@ -67,6 +67,9 @@ uint32_t apollo_cs35l41_monitor(bool tell);
 void apollo_touch_screen(bool on);      /* the display is off or on: the touch chip sleeps or wakes (hakios.apollo_touch.c) */
 void apollo_cpufreq_screen(bool on);   /* the display off: every core group at its lowest speed (bsd/dev/hakios.apollo_cpufreq.c) */
 
+/* The Wi-Fi (apollo_wifi=N): the QCA6390 on PCIe0 (bsd/dev/hakios.apollo_pcie.c) */
+void apollo_wifi_init(void);
+void apollo_wifi_quiesce(void);         /* any way back: PERST# and WLAN_EN down (loader_return.c) */
 #include <kern/locks.h>
 extern lck_mtx_t apollo_smmu_lock;      /* the apps SMMU's match registers and contexts: whoever takes one (hakios.apollo_sound.c, hakios.apollo_pcie.c) */
 
