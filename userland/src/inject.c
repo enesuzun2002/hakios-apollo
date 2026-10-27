@@ -580,6 +580,201 @@ brightness_fixes(void)
 	method_setImplementation(method, (IMP)wait_for_als_arrival);
 }
 
+/* ---- backboardd: the brightness slider, for a kernel that has a backlight ------------------------------- */
+
+/*
+ * The brightness iOS settles on (Control Center's slider, Settings) reaches backboardd's BrightnessSystem as
+ * -setProperty:forKey: with the key "DisplayBrightness" (a number 0 to 1, or a dictionary with "Brightness").
+ * CoreBrightness would pass it on to the display as IOMFBBrightnessLevel only once it has found a backlight
+ * service of the kind real hardware has; this kernel has none, so it is taken here and handed to the kernel's
+ * sysctl kern.apollo.backlight (percent; the Mi 10T's devices/mi-10t/xnu: hakios.apollo_backlight.c). Where that sysctl does not
+ * exist (any other phone) nothing is installed.
+ */
+static void (*orig_brightness_set_property)(id, SEL, id, id);
+static void (*orig_brightness_internal_set_property)(id, SEL, id, id);
+
+static void my_brightness_take(id value, id key);
+
+static void
+my_brightness_set_property(id self, SEL selector, id value, id key)
+{
+	orig_brightness_set_property(self, selector, value, key);
+	my_brightness_take(value, key);
+}
+
+/* (the object backboardd talks to may be CoreBrightness's BrightnessSystemInternal, which has a setter of its own) */
+static void
+my_brightness_internal_set_property(id self, SEL selector, id value, id key)
+{
+	orig_brightness_internal_set_property(self, selector, value, key);
+	my_brightness_take(value, key);
+}
+
+static void
+my_brightness_take(id value, id key)
+{
+	CFTypeRef number = (CFTypeRef)value;
+	float brightness = -1;
+	static unsigned said;
+
+	if (key == NULL || !CFEqual((CFTypeRef)key, CFSTR("DisplayBrightness")) || value == NULL) {
+		return;
+	}
+	if (CFGetTypeID(number) == CFDictionaryGetTypeID()) {
+		number = CFDictionaryGetValue((CFDictionaryRef)value, CFSTR("Brightness"));
+	}
+	if (number != NULL && CFGetTypeID(number) == CFNumberGetTypeID() &&
+	    CFNumberGetValue((CFNumberRef)number, kCFNumberFloatType, &brightness) && brightness >= 0) {
+		int percent = (int)(brightness * 100.0f + 0.5f);
+
+		percent = percent > 100 ? 100 : percent;
+		if (sysctlbyname("kern.apollo.backlight", NULL, NULL, &percent, sizeof(percent)) != 0 && said++ < 4) {
+			say("hakios: DisplayBrightness %.3f: kern.apollo.backlight refuses it (%d)\n", brightness, errno);
+		} else if (said++ < 4) {
+			say("hakios: DisplayBrightness %.3f: the backlight to %d%%\n", brightness, percent);
+		}
+	}
+}
+
+/* a class's own setProperty:forKey:, not one it inherits */
+static Method
+own_method(Class cls, SEL selector)
+{
+	unsigned count = 0;
+	Method *methods = cls ? class_copyMethodList(cls, &count) : NULL, found = NULL;
+
+	for (unsigned i = 0; i < count && found == NULL; i++) {
+		if (method_getName(methods[i]) == selector) {
+			found = methods[i];
+		}
+	}
+	free(methods);
+	return found;
+}
+
+/*
+ * Where the slider's level arrives when CoreBrightness has no display of its own: SpringBoard's BKSDisplayBrightnessSet
+ * reaches backboardd's -[BKDisplayBrightnessController setBrightnessLevel:reason:options:] (a level 0 to 1). Its first
+ * argument is a float or a double depending on the build: the method's type encoding says which.
+ */
+static void brightness_level_hook_set(void);
+static void (*orig_level_float)(id, SEL, float, id, id);
+static void (*orig_level_double)(id, SEL, double, id, id);
+
+static void
+level_to_backlight(double level, const char *how)
+{
+	int percent = (int)(level * 100.0 + 0.5);
+	static unsigned said;
+
+	percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+	if (said++ < 8) {
+		say("hakios: brightness level %.3f (%s): the backlight to %d%%\n", level, how, percent);
+	}
+	sysctlbyname("kern.apollo.backlight", NULL, NULL, &percent, sizeof(percent));
+}
+
+static void
+my_level_float(id self, SEL selector, float level, id reason, id options)
+{
+	orig_level_float(self, selector, level, reason, options);
+	level_to_backlight(level, "setBrightnessLevel");
+}
+
+static void
+my_level_double(id self, SEL selector, double level, id reason, id options)
+{
+	orig_level_double(self, selector, level, reason, options);
+	level_to_backlight(level, "setBrightnessLevel");
+}
+
+/*
+ * The level does not get that far by itself: backboardd's handler of BKSDisplayBrightnessSet (a MIG routine) first asks
+ * -[BKDisplayBrightnessController isBrightnessLevelControlAvailable], which on this kernel says no (no AppleARMBacklight
+ * HID service), and drops the level. Where the kernel has a backlight, the answer is yes (SpringBoard's Control Center
+ * asks the same through BackBoardServices, so its slider is enabled by it too).
+ */
+static BOOL
+my_level_control_available(__unused id self, __unused SEL selector)
+{
+	return YES;
+}
+
+static void
+brightness_level_hook(void)
+{
+	Class controller = objc_getClass("BKDisplayBrightnessController");
+	Method available = controller ? class_getInstanceMethod(controller, sel_registerName("isBrightnessLevelControlAvailable")) : NULL;
+
+	if (available != NULL) {
+		method_setImplementation(available, (IMP)my_level_control_available);
+		say("hakios: -[BKDisplayBrightnessController isBrightnessLevelControlAvailable]: yes, the kernel has a backlight\n");
+	}
+	brightness_level_hook_set();
+}
+
+static void
+brightness_level_hook_set(void)
+{
+	Class cls = objc_getClass("BKDisplayBrightnessController");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("setBrightnessLevel:reason:options:")) : NULL;
+	const char *types = method ? method_getTypeEncoding(method) : NULL;
+
+	if (types == NULL) {
+		say("hakios: no -[BKDisplayBrightnessController setBrightnessLevel:reason:options:]\n");
+		return;
+	}
+	if (strstr(types, ":8f") != NULL) {
+		orig_level_float = (void (*)(id, SEL, float, id, id))method_getImplementation(method);
+		method_setImplementation(method, (IMP)my_level_float);
+	} else if (strstr(types, ":8d") != NULL) {
+		orig_level_double = (void (*)(id, SEL, double, id, id))method_getImplementation(method);
+		method_setImplementation(method, (IMP)my_level_double);
+	} else {
+		say("hakios: -[BKDisplayBrightnessController setBrightnessLevel:reason:options:] is \"%s\": not hooked\n", types);
+		return;
+	}
+	say("hakios: -[BKDisplayBrightnessController setBrightnessLevel:reason:options:] (%s) drives the backlight\n", types);
+}
+
+static void
+brightness_slider(unsigned tries)
+{
+	int percent;
+	size_t size = sizeof(percent);
+	Class cls;
+	Method method;
+
+	if (sysctlbyname("kern.apollo.backlight", &percent, &size, NULL, 0) != 0) {
+		return;                                 /* (no backlight of ours) */
+	}
+	cls = objc_getClass("BrightnessSystem");
+	method = cls ? class_getInstanceMethod(cls, sel_registerName("setProperty:forKey:")) : NULL;
+	if (method == NULL) {
+		if (tries < 30) {                       /* (CoreBrightness may not be loaded yet) */
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+				brightness_slider(tries + 1);
+			});
+		} else {
+			say("hakios: no -[BrightnessSystem setProperty:forKey:]: the brightness slider stays unconnected\n");
+		}
+		return;
+	}
+	orig_brightness_set_property = (void (*)(id, SEL, id, id))method_getImplementation(method);
+	method_setImplementation(method, (IMP)my_brightness_set_property);
+	{
+		Method internal = own_method(objc_getClass("BrightnessSystemInternal"), sel_registerName("setProperty:forKey:"));
+
+		if (internal != NULL) {
+			orig_brightness_internal_set_property = (void (*)(id, SEL, id, id))method_getImplementation(internal);
+			method_setImplementation(internal, (IMP)my_brightness_internal_set_property);
+			say("hakios: -[BrightnessSystemInternal setProperty:forKey:] watched too\n");
+		}
+	}
+	brightness_level_hook();
+	say("hakios: the brightness slider drives the backlight (kern.apollo.backlight, now %d%%)\n", percent);
+}
+
 /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
 
 /* IOKit's HID event system, the part that has no public header on iOS (prototypes checked against 20F66) */
@@ -1188,6 +1383,7 @@ hakios_init(void)
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
 		input_start();
+		brightness_slider(0);
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
 	}
