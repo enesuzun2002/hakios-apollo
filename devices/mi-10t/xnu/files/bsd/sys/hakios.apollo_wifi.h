@@ -13,7 +13,12 @@
  * channels (MHI 20 to the chip, 21 from it) started. Idempotent: 0 at once when it is already so. 0 or an errno. Sleeps.
  */
 int apollo_wifi_power_up(void);
-void apollo_wifi_power_down(void);      /* PERST# down, the rails off (apollo_wifi_quiesce's way, from a thread) */
+/*
+ * The IPCR channels reset and their threads ended, then apollo_wifi_quiesce()'s way: the MSIs masked, the LTSSM off, PERST# and WLAN_EN
+ * down, the chip's SMMU context off. The RPMh votes for the rails and CX, and the pcie_0 clocks, are NOT withdrawn (no off-vote has been
+ * tried on the phone). One way: after it, power up says ENOTSUP until the next boot (W1 to W2c are not made for a second run). Sleeps.
+ */
+void apollo_wifi_power_down(void);
 
 /*
  * DMA: page-aligned kernel memory (contiguous or not) entered in the chip's SMMU context; *iova is what the chip uses.

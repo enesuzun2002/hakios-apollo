@@ -29,6 +29,7 @@
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern kern_return_t thread_terminate(thread_t thread);
 extern void thread_set_thread_name(thread_t thread, const char *name);
@@ -79,7 +80,7 @@ apollo_lx_os_free(void *memory, unsigned long size)
  * those pages.
  */
 /*
- * The ath11k object's DMA pool (lx_base.c: POOL_SIZE, 44 MB) in one physical piece: on the phone (25 October) that was not
+ * The ath11k object's DMA pool (lx_base.c's POOL_SIZE: 64 MB in the apollo build, devices/mi-10t/tools/mk-ath11k.sh) in one physical piece: on the phone (25 October) that was not
  * to be had by the time the chip was up, so hakios.apollo_pcie.c asks for it while the kernel starts (apollo_wifi >= 5).
  */
 static vm_offset_t reserved;
@@ -105,10 +106,13 @@ apollo_lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	vm_offset_t cached = 0, uncached;
 	uint64_t physical;
 
+	bool from_reserve = false;
+
 	size = round_page(size);
 	if (reserved != 0 && size <= reserved_size) {
-		cached = reserved;      /* taken at boot (apollo_lx_reserve()): later, 44 MB in one piece was not to be had */
-		reserved = 0;
+		cached = reserved;      /* taken at boot (apollo_lx_reserve()): later, 64 MB in one piece was not to be had */
+		reserved = 0;           /* (given back below when this fails: the next try may have it) */
+		from_reserve = true;
 	} else if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS) {
 		say("apollo lx: no %lu bytes of memory in one piece\n", size);
@@ -123,13 +127,21 @@ apollo_lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
 	if (uncached == 0) {
 		say("apollo lx: cannot map %lu bytes of the chip's memory uncached\n", size);
-		return NULL;
+		goto failed;
 	}
 	if (apollo_wifi_dma_map((void *)cached, size, address) != 0) {
 		say("apollo lx: the chip's SMMU takes no %lu bytes\n", size);
-		return NULL;
+		ml_io_unmap(uncached, size);    /* (the chip was never given an address in it: nothing of it is in use) */
+		goto failed;
 	}
 	return (void *)uncached;
+failed:
+	if (from_reserve) {
+		reserved = cached;
+	} else {
+		kmem_free(kernel_map, cached, size);
+	}
+	return NULL;
 }
 
 void *
@@ -689,22 +701,30 @@ apollo_lx_os_irq_disable(unsigned vector)
 	lck_mtx_unlock(&lx_irq_lock);
 }
 
+/*
+ * Every vector marked detached under lx_irq_lock first, and the functions under way waited for: from then on neither the thread nor
+ * apollo_lx_os_irq_enable() (it looks at attached) unmasks an SPI that is about to go. Then the GIC's side.
+ */
 void
 apollo_lx_os_irq_detach_all(void)
 {
-	for (unsigned v = 0; v < LX_VECTORS; v++) {
-		if (lx_vector[v].attached) {
-			gic_v3_spi_detach(apollo_wifi_intid(v));
-		}
-	}
+	bool was[LX_VECTORS];
+
 	lck_mtx_lock(&lx_irq_lock);
 	for (unsigned v = 0; v < LX_VECTORS; v++) {
+		was[v] = lx_vector[v].attached;
 		lx_vector[v].attached = false;
 	}
 	while (lx_irq_running != 0 && current_thread() != lx_irq_thread) {
 		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
 	}
 	lck_mtx_unlock(&lx_irq_lock);
+	for (unsigned v = 0; v < LX_VECTORS; v++) {
+		if (was[v]) {
+			gic_v3_spi_mask(apollo_wifi_intid(v));
+			gic_v3_spi_detach(apollo_wifi_intid(v));
+		}
+	}
 	os_atomic_store(&lx_irq_pending, 0, relaxed);
 }
 
@@ -730,7 +750,10 @@ apollo_lx_os_station_lost(int error)
 
 /* ---- the driver ---------------------------------------------------------------------------------------- */
 
-/* The object has its own; this is the one of a kernel built without it. */
+/*
+ * The object has its own (strong: mk-ath11k.sh exports apollo_lx_prepare/start/stop/transmit); these are the ones of a kernel built
+ * without it, and the only stand-ins (hakios.apollo_pcie.c has none). Weak, so that the object's win when it is linked in.
+ */
 __attribute__((weak)) int
 apollo_lx_start(void)
 {

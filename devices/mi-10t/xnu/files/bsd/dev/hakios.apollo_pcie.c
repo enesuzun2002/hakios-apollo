@@ -244,7 +244,10 @@ cmd_db_list(void)
 	say("%s\n", line);
 }
 
-/* One request of up to 16 writes, made at once (active), through TCS 1; true when RPMh says done */
+/*
+ * One request of up to 16 writes, made at once (active), through TCS 1; true when RPMh says done. TCS 1 is shared with
+ * apollo_rpmh_bcm_vote() (hakios.apollo_cpufreq.c): the whole request, its wait included, under apollo_rpmh_tcs1_lock.
+ */
 static bool
 tcs_send(const uint32_t *address, const uint32_t *value, unsigned count, const char *what)
 {
@@ -252,7 +255,9 @@ tcs_send(const uint32_t *address, const uint32_t *value, unsigned count, const c
 	uint32_t mask = (count >= 32 ? ~0u : (1u << count) - 1), done = 0;
 	uint64_t began;
 
+	lck_mtx_lock(&apollo_rpmh_tcs1_lock);
 	if (rd(tcs + TCS_STATUS) == 0) {
+		lck_mtx_unlock(&apollo_rpmh_tcs1_lock);
 		say("apollo wifi: RPMh's TCS %u is busy (control %#x): %s not asked\n", WIFI_TCS, rd(tcs + TCS_CONTROL), what);
 		return false;
 	}
@@ -302,6 +307,7 @@ tcs_send(const uint32_t *address, const uint32_t *value, unsigned count, const c
 	wr(rsc + RSC_IRQ_CLEAR, 1u << WIFI_TCS);
 	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(tcs + TCS_ENABLED, 0);
+	lck_mtx_unlock(&apollo_rpmh_tcs1_lock);
 	say("apollo wifi: RPMh %s %s (%u writes, %llu us)\n", done ? "has done" : "HAS NOT SAID DONE to", what, count,
 	    now_us() - began);
 	return done != 0;
@@ -340,7 +346,7 @@ static const struct {
 	{ "smpa4", 1800, false },       /* vdd-wlan-io */
 	{ "smpa5", 1900, true },        /* vdd-wlan-rfa1 */
 	{ "smpc8", 1350, true },        /* vdd-wlan-rfa2 */
-	{ "smpf2", 950, false, true },  /* not a supply of cnss's (vdd-wlan-* are smpa6/smpa4/smpa5/smpc8): only qcom,cmd_db_name, the CPR's PMIC address; this phone's cmd-db has no smpf* (see apollo_wifi_set_pmu_mv) */
+	{ "smpf2", 950, false, true },  /* not a supply of cnss's (vdd-wlan-* are smpa6/smpa4/smpa5/smpc8): only qcom,cmd_db_name, the CPR's PMIC address; this phone's cmd-db has no smpf* (so no CPR voltage either: cnss2's cnss_update_cpr_info() needs it) */
 	{ "ldoa5", 880, true },         /* PCIe's vreg-0p9, 73.5 mA */
 	{ "ldoa9", 1200, true },        /* PCIe's vreg-1p8 (1.2 V on this phone), 16 mA */
 };
@@ -351,7 +357,7 @@ power_on(void)
 {
 	uint32_t address[16], value[16], base[RAILS], cx, length = 0;
 	const uint8_t *levels = NULL;
-	unsigned n = 0, position = 0;
+	unsigned n = 0, position = ~0u;
 
 	for (unsigned r = 0; r < RAILS; r++) {
 		base[r] = cmd_db_find(rails[r].name, NULL, NULL);
@@ -378,6 +384,11 @@ power_on(void)
 			position = l;
 			break;
 		}
+	}
+	if (position == ~0u) {
+		/* (a vote for position 0 would be CX off, not a level for the chip: nothing is asked) */
+		say("apollo wifi: cx.lvl has no level of 0x100 or more among its first %u: no CX vote, no power\n", length / 2 < 16 ? length / 2 : 16);
+		return false;
 	}
 	/* first the voltages and the modes, then the enables and the CX level */
 	for (unsigned r = 0; r < RAILS; r++) {
@@ -410,67 +421,6 @@ power_on(void)
 	}
 	say("apollo wifi: cx.lvl at %#x: position %u\n", cx, position);
 	return true;
-}
-
-/*
- * cnss2's CPR update (Xiaomi_Kernel_OpenSource apollo-q-oss, drivers/net/wireless/cnss2/power.c: cnss_get_cpr_info(), cnss_update_cpr_info()):
- *   DT /soc/qcom,cnss-qca6390@b0000000: reg-names "tcs_cmd" = 0x0b2e5510, size 0x5c0 (the apps RSC's TCS command registers); qcom,cmd_db_name "smpf2"
- *   cpr_pmic_addr = cmd_db_read_addr("smpf2")           (no address: no CPR, cnss only logs an error)
- *   WLFW target capability response (qmi.c cnss_wlfw_tgt_cap_send_sync(), before BDF/M3 and the mode): voltage_mv (voltage_mv_valid)
- *   for i in TCS 0..7 (MAX_TCS_NUM), j in command 0..4 (MAX_TCS_CMD_NUM): offset = i * 0xC8 (TCS_OFFSET) + j * 0x10 (TCS_CMD_OFFSET);
- *     the command's address register is at tcs_cmd + offset; when it equals cpr_pmic_addr, the command's data register is at +4
- *     (TCS_CMD_DATA_ADDR_OFFSET); the one with the highest voltage in it is the one kept
- *   write max(voltage_mv, 950 (BT_CXMX_VOLTAGE_MV)) into that data register (writel_relaxed)
- * This phone's command database has no "smpf2" (W1 logs it), so the function reports ENOENT and writes nothing.
- */
-#define TCS_CMD_PHYS            0x0b2e5510UL
-#define TCS_CMD_SIZE            0x5c0
-#define TCS_OFFSET              0xc8
-#define TCS_CMD_OFFSET          0x10
-#define TCS_CMD_DATA_OFFSET     0x4
-#define TCS_MAX_NUM             8
-#define TCS_MAX_CMD             5
-#define PMU_MIN_MV              950             /* BT_CXMX_VOLTAGE_MV */
-
-int
-apollo_wifi_set_pmu_mv(uint32_t mv)
-{
-	uint32_t pmic = cmd_db_find("smpf2", NULL, NULL), best = 0;
-	vm_offset_t tcs, data = 0;
-
-	if (mv == 0) {
-		return EINVAL;
-	}
-	if (pmic == 0) {
-		say("apollo wifi: PMU: cmd-db has no smpf2: the CPR voltage (%u mV) is not written (cnss2 would not either)\n", mv);
-		return ENOENT;
-	}
-	tcs = ml_io_map(TCS_CMD_PHYS & ~0xfffUL, 0x1000) + (TCS_CMD_PHYS & 0xfffUL);
-	if (tcs == (TCS_CMD_PHYS & 0xfffUL)) {
-		return ENOMEM;
-	}
-	for (unsigned i = 0; i < TCS_MAX_NUM; i++) {
-		for (unsigned j = 0; j < TCS_MAX_CMD; j++) {
-			vm_offset_t command = tcs + i * TCS_OFFSET + j * TCS_CMD_OFFSET;
-
-			if (i * TCS_OFFSET + j * TCS_CMD_OFFSET + TCS_CMD_DATA_OFFSET + 4 > TCS_CMD_SIZE || rd(command) != pmic) {
-				continue;
-			}
-			say("apollo wifi: PMU: TCS %u command %u has smpf2 (%#x): data %u\n", i, j, pmic, rd(command + TCS_CMD_DATA_OFFSET));
-			if (rd(command + TCS_CMD_DATA_OFFSET) > best) {
-				best = rd(command + TCS_CMD_DATA_OFFSET);
-				data = command + TCS_CMD_DATA_OFFSET;
-			}
-		}
-	}
-	if (data == 0) {
-		say("apollo wifi: PMU: no TCS command for smpf2 (%#x)\n", pmic);
-		return ENOENT;
-	}
-	mv = mv > PMU_MIN_MV ? mv : PMU_MIN_MV;
-	wr(data, mv);
-	say("apollo wifi: PMU: smpf2 CPR voltage %u mV written to the TCS data register at %#lx (was %u)\n", mv, (unsigned long)(TCS_CMD_PHYS + (data - tcs)), best);
-	return 0;
 }
 
 /* ---- clocks and the power domain (GCC, kona: gcc-kona.c) ------------------------------------------- */
@@ -541,7 +491,7 @@ clocks_on(void)
 	    !rcg_set(REFGEN_RCG, 1 << 8 | 11, "the PHY's refgen (GPLL0 / 6, 100 MHz)")) {
 		return false;
 	}
-	wr(gcc + GCC_VOTE, rd(gcc + GCC_VOTE) | VOTE_PCIE0);
+	apollo_gcc_vote(gcc + GCC_VOTE, VOTE_PCIE0);    /* (shared with the touch, haptic and amplifier drivers: under its lock) */
 	if (!branch_on(TBU_CBCR, "the aggregate NoC's PCIe TBU clock") || !branch_on(SF_TBU_CBCR, "DDRSS's PCIe TBU clock") ||
 	    !branch_on(REFGEN_CBCR, "the PHY's refgen clock") || !branch_on(WIFI_CLKREF, "the Wi-Fi's clock reference")) {
 		return false;
@@ -1386,8 +1336,10 @@ chip_prepare(void)
 	}
 	cfg_look("before", &before);
 	hw = rd(bar + CHIP_TCSR_HW_VERSION);
-	say("apollo wifi: prep: TCSR_SOC_HW_VERSION %#x (major %u, minor %u); before: MHISTATUS %#x, MHICTRL %#x, BHI execution environment %#x\n", hw,
-	    hw >> 8 & 0xf, hw & 0xff, rd(bar + MHI_STATUS), rd(bar + MHI_CTRL), rd(bar + rd(bar + MHI_BHI_OFF) + BHI_EXECENV));
+	bhi = rd(bar + MHI_BHI_OFF);                    /* (read once; all ones from a chip that does not answer: no read through it) */
+	say("apollo wifi: prep: TCSR_SOC_HW_VERSION %#x (major %u, minor %u); before: MHISTATUS %#x, MHICTRL %#x, BHI at +%#x, BHI execution environment %#x\n", hw,
+	    hw >> 8 & 0xf, hw & 0xff, rd(bar + MHI_STATUS), rd(bar + MHI_CTRL), bhi,
+	    bhi != 0 && bhi != ~0u && (uint64_t)bhi + BHI_EXECENV + 4 <= bar_mapped ? rd(bar + bhi + BHI_EXECENV) : ~0u);
 	w2b_hold("the chip-internal registers: the BAR window register, then the chip's PARF LTSSM, GCC hot reset, interrupt clear, WLAON power control, "
 	    "QSERDES/PCS L1SS registers, BHIe/MHI vector registers, WLAON warm entry");
 	chip_window = 0;                                /* ath11k_pci_power_up(): ab_pci->register_window = 0 */
@@ -1571,7 +1523,7 @@ first_stage(void)
 		return false;
 	}
 	offset = rd(bar + MHI_BHI_OFF);
-	if (offset == 0 || offset > 0xfff00) {
+	if (offset == 0 || offset == ~0u || (uint64_t)offset + BHI_SERIALNU + 4 > bar_mapped) {   /* (BHI's registers go up to SERIALNU) */
 		say("apollo wifi: W2b: no BHI block where MHI says (%#x)\n", offset);
 		return false;
 	}
@@ -1837,6 +1789,12 @@ static LCK_SPIN_DECLARE(wifi_wake_lock, &wifi_lck_grp); /* apollo_wifi_wake (Lin
 static volatile bool wifi_dead;                         /* the firmware crashed (SYS_ERR / RDDM seen): nothing but the RDDM collection touches the chip any more */
 static volatile bool w2c_m2;                            /* the host put MHI in M2 (mhi_pm_m1_transition) and no M0 event came yet */
 static volatile bool wifi_amss;                         /* the chip runs its firmware (AMSS) with MHI in M0: chip_rd/wr and the doorbells may be used */
+/*
+ * The link is up and PERST# high: BAR0 may be touched. Set by W1 once the link is up, cleared by apollo_wifi_quiesce() before PERST# drops.
+ * The writers of the IPCR threads' paths (mhi_write64, the doorbells, apollo_wifi_read32/write32, the RDDM collection) check it, so that
+ * a thread still on its way out after power down does not touch a BAR whose link is gone (that hangs the bus).
+ */
+static volatile bool wifi_link_alive;
 
 static bool ipcr_event(unsigned ring, uint64_t index, const volatile uint32_t *tre);
 static void mhi_wake_hold(void);
@@ -1844,6 +1802,7 @@ static bool mhi_wake_is_held(void);
 static void mhi_wake_reassert(void);
 static bool ipcr_cmd_pending(void);
 static bool ipcr_up(void);
+static bool ipcr_stopping(void);
 void apollo_wifi_wake(int on);
 static void wifi_mark_dead(const char *why);
 
@@ -1950,6 +1909,9 @@ wsmmu_map(vm_offset_t buffer, uint32_t bytes, uint64_t *iova)
 static void
 mhi_write64(vm_offset_t low_register, uint64_t value)
 {
+	if (!wifi_link_alive) {
+		return;                         /* (power down has taken the link away: no BAR write) */
+	}
 	__asm__ volatile ("dsb sy");            /* the (uncached) ring and context stores are visible before the doorbell */
 	wr(bar + low_register + 4, (uint32_t)(value >> 32));
 	wr(bar + low_register, (uint32_t)value);
@@ -2517,6 +2479,10 @@ wifi_rddm_collect(const char *why)
 	rddm.collected = true;
 	say("apollo wifi: RDDM: collecting (%s)\n", why);
 	while (now_us() - began < 5000000ull) {         /* the firmware enters RDDM by itself after its SYS_ERR */
+		if (ipcr_stopping() || !wifi_link_alive) {
+			say("apollo wifi: RDDM: power down: the collection is given up\n");
+			return;
+		}
 		ee = rd(bhi_base + BHI_EXECENV);
 		if (ee == MHI_EE_RDDM || ee == ~0u) {
 			break;
@@ -2528,10 +2494,17 @@ wifi_rddm_collect(const char *why)
 		return;
 	}
 	for (began = now_us(); now_us() - began < RDDM_WAIT_US; sleep_ms(10)) {
+		if (ipcr_stopping() || !wifi_link_alive) {
+			say("apollo wifi: RDDM: power down: the collection is given up\n");
+			return;
+		}
 		status = rd(base + BHIE_RXVECSTATUS_OFF);
 		if (status == ~0u || (status >> 30) == BHIE_STATUS_XFER_COMPL || (status >> 30) == BHIE_STATUS_ERROR) {
 			break;
 		}
+	}
+	if (ipcr_stopping() || !wifi_link_alive) {
+		return;
 	}
 	say("apollo wifi: RDDM: RXVECSTATUS %#x (status %u, sequence %u) after %llu ms; BHI error %#x, debug %#x %#x\n", status, status >> 30,
 	    status & BHIE_SEQ_MASK, (now_us() - began) / 1000, rd(bhi_base + BHI_ERRCODE), rd(bhi_base + BHI_ERRDBG1), rd(bhi_base + BHI_ERRDBG2));
@@ -2689,7 +2662,7 @@ w2c_ready_m0(void)
 	w2c_rddm_prepare();                     /* mhi_prepare_for_power_up(): before the chip runs on (not fatal when it fails) */
 	/* mhi_init_mmio(): the register values come from the contexts and from the window */
 	offset = rd(bar + MHI_ERDBOFF);
-	if (offset == 0 || offset >= 0xfff00) {
+	if (offset == 0 || offset == ~0u || (uint64_t)offset + 8 * W2C_EVENT_RINGS > bar_mapped) {         /* (a doorbell of 8 bytes per event ring) */
 		say("apollo wifi: W2c: ERDBOFF %#x is out of range\n", offset);
 		return false;
 	}
@@ -2717,7 +2690,7 @@ w2c_ready_m0(void)
 			event[ring].wp = w2c.wp[ring] = event[ring].rbase + event[ring].rlen - W2C_ELEMENT;
 		}
 		w2c.erdb = offset;
-		w2c.chdb = rd(bar + MHI_CHDBOFF);
+		w2c.chdb = rd(bar + MHI_CHDBOFF);       /* (checked where it is used: chdb_ok()) */
 		for (unsigned ring = 0; ring < W2C_EVENT_RINGS; ring++) {
 			mhi_write64(offset + 8 * ring, event[ring].wp);
 		}
@@ -2760,7 +2733,7 @@ w2c_bhie(void)
 	uint64_t vector = w2c.ctrl_iova + W2C_OFF_VECTOR, began;
 	uint32_t length = w2c.segments * 16, offset = rd(bar + MHI_BHIE_OFF), sequence, status = 0, db;
 
-	if (offset == 0 || offset >= 0xfff00) {
+	if (offset == 0 || offset == ~0u || (uint64_t)offset + BHIE_RXVECSTATUS + 4 > bar_mapped) {
 		say("apollo wifi: W2c: no BHIe block where MHI says (%#x)\n", offset);
 		return false;
 	}
@@ -2869,7 +2842,8 @@ mission_mode(void)
  *   +0x0000  channel 20's transfer ring (64 elements of 16 bytes)
  *   +0x1000  channel 21's transfer ring
  *   +0x2000  the bounce buffer of apollo_ipcr_send (16 KB)
- *   +0x6000  32 receive buffers of 8 KB (256 KB): channel 21's TREs, IEOT set, chain clear
+ *   +0x6000  32 receive buffers of 16 KB (512 KB): channel 21's TREs, IEOT set, chain clear
+ * (16 KB: a QRTR packet is up to 8192 bytes of payload and its header, more than 8 KB; Linux's buffers are MHI_MAX_MTU, 64 KB)
  */
 #define IPCR_ELEMENTS           64              /* .num_elements of both channels */
 #define IPCR_OFF_UL_RING        0x0000
@@ -2877,12 +2851,11 @@ mission_mode(void)
 #define IPCR_OFF_TX             0x2000
 #define IPCR_TX_SIZE            0x4000
 #define IPCR_OFF_RX             0x6000
-#define IPCR_RX_SIZE            0x2000
+#define IPCR_RX_SIZE            0x4000          /* (the TRE's length field is 16 bits) */
 #define IPCR_RX_BUFFERS         32              /* half the ring: a TRE ring of 64 holds 63 at most */
 #define IPCR_PAGES              (IPCR_OFF_RX / 4096 + IPCR_RX_BUFFERS * IPCR_RX_SIZE / 4096)
 #define IPCR_CMD_TIMEOUT_MS     20000           /* ath11k_mhi_register(): mhi_ctrl->timeout_ms = 20 * 1000 */
 #define IPCR_TX_TIMEOUT_MS      3000
-#define IPCR_CHDB_FAULTS        0xfff00u
 #define IPCR_LOG_MOST           40              /* packets told in the log */
 
 static struct {
@@ -2891,6 +2864,8 @@ static struct {
 	volatile bool up, stop, failed;
 	volatile bool event_alive, deliver_alive;
 	uint32_t ul_wp, dl_wp;          /* the host's write element index of each ring (mhi_ring wp) */
+	volatile uint32_t ul_rp;        /* the UL element after the last one the chip has completed (its transfer events) */
+	volatile bool ul_failed;        /* a send timed out: its TRE may still point at the bounce buffer, so no more sends */
 	uint8_t dl_slot[IPCR_ELEMENTS]; /* the receive buffer each DL element carries */
 	struct {
 		uint8_t buffer;
@@ -2919,11 +2894,18 @@ static LCK_MTX_DECLARE(ipcr_cmd_lock, &wifi_lck_grp);   /* one command on the co
 
 static void wake_toggle(void);
 
+/* CHDBOFF in BAR0 with room for all 128 doorbells of 8 bytes (the wake doorbell 127, at +0x3f8, is the last) */
+static bool
+chdb_ok(void)
+{
+	return w2c.chdb != 0 && w2c.chdb != ~0u && (uint64_t)w2c.chdb + 8 * 128 <= bar_mapped;
+}
+
 /* mhi_write_db() of channel (or doorbell number) n: the high half first, then the low half. Not to a crashed chip; in M2 the wake first (main.c wake_toggle) */
 static void
 ipcr_channel_db(unsigned n, uint64_t value)
 {
-	if (wifi_dead) {
+	if (wifi_dead || !wifi_link_alive) {
 		return;
 	}
 	if (n != MHI_DEV_WAKE_DB && w2c_m2) {
@@ -2946,7 +2928,7 @@ wifi_mark_dead(const char *why)
 void
 apollo_wifi_wake(int on)
 {
-	bool valid = wifi_amss && w2c.chdb != 0 && w2c.chdb < IPCR_CHDB_FAULTS;
+	bool valid = wifi_amss && chdb_ok();
 
 	if (wifi_dead) {
 		return;
@@ -2976,7 +2958,7 @@ mhi_wake_hold(void)
 	uint64_t began = now_us();
 	uint32_t mhi = ~0u;
 
-	if (wifi_dead || w2c.chdb == 0 || w2c.chdb >= IPCR_CHDB_FAULTS) {
+	if (wifi_dead || !chdb_ok()) {
 		return;
 	}
 	lck_spin_lock(&wifi_wake_lock);
@@ -3061,6 +3043,13 @@ ipcr_up(void)
 	return ipcr.up;
 }
 
+/* power down has begun: the IPCR threads are on their way out (wifi_rddm_collect() gives up) */
+static bool
+ipcr_stopping(void)
+{
+	return ipcr.stop;
+}
+
 /* a transfer ring element: ptr in words 0 and 1, dword[0] = length, dword[1] = type 2 (transfer) and IEOT (MHI_TRE_DATA_DWORD1(0, 1, 0, 0)) */
 static void
 ipcr_tre(vm_offset_t element, uint64_t buffer, uint32_t length)
@@ -3115,6 +3104,11 @@ ipcr_event(unsigned ring, __unused uint64_t index, const volatile uint32_t *tre)
 		return true;
 	}
 	if (chan == IPCR_UL) {
+		uint64_t ring_base = ipcr.rings_iova + IPCR_OFF_UL_RING;
+
+		if (ptr >= ring_base && ptr < ring_base + IPCR_ELEMENTS * W2C_ELEMENT && (ptr - ring_base) % W2C_ELEMENT == 0) {
+			ipcr.ul_rp = (uint32_t)((ptr - ring_base) / W2C_ELEMENT + 1) % IPCR_ELEMENTS;  /* (the chip's rp: the ring-full check of send) */
+		}
 		if (ptr == ipcr.tx_ptr) {                       /* (a late event of a send that timed out is not the one waited for) */
 			ipcr.tx_code = code;
 			ipcr.tx_done = true;
@@ -3169,7 +3163,7 @@ ipcr_event_thread(__unused void *parameter, __unused wait_result_t result)
 		w2c_events();                   /* (returns at once once the firmware has crashed) */
 		/* the radio driver at work: a refused access of the chip's, or the firmware down (SYS_ERR), is told once */
 		wsmmu_faults(&fault_told);
-		if (!error_told && (wifi_dead || (rd(bar + MHI_STATUS) >> 8 & 0xff) == 0xff)) {
+		if (!error_told && !ipcr.stop && wifi_link_alive && (wifi_dead || (rd(bar + MHI_STATUS) >> 8 & 0xff) == 0xff)) {
 			error_told = true;
 			wifi_mark_dead("the firmware went to SYS_ERR while the driver ran");   /* from here nothing but the RDDM collection touches the chip */
 			/* (no wifi_final_dump(): its window registers are accesses to a crashed chip) */
@@ -3299,7 +3293,7 @@ ipcr_start(void)
 	if (ipcr.failed) {
 		return EIO;
 	}
-	if (!wifi_amss || w2c.chdb == 0 || w2c.chdb >= IPCR_CHDB_FAULTS) {
+	if (!wifi_amss || !chdb_ok()) {
 		say("apollo wifi: IPCR: the chip is not in mission mode, or its channel doorbells are not known (%#x)\n", w2c.chdb);
 		return ENXIO;
 	}
@@ -3325,7 +3319,8 @@ ipcr_start(void)
 			return ENOMEM;
 		}
 	}
-	ipcr.ul_wp = ipcr.dl_wp = ipcr.cmd_wp = 0;
+	ipcr.ul_wp = ipcr.dl_wp = ipcr.cmd_wp = ipcr.ul_rp = 0;
+	ipcr.ul_failed = false;
 	ipcr.queue_head = ipcr.queue_count = 0;
 	ipcr.stop = false;
 	ipcr.event_alive = ipcr.deliver_alive = true;
@@ -3398,6 +3393,20 @@ apollo_ipcr_send(const void *data, unsigned long length)
 		return EMSGSIZE;
 	}
 	lck_mtx_lock(&ipcr_tx_lock);
+	/* (again under the lock: power down clears ipcr.up holding it, so no send begins on a channel being reset) */
+	if (!ipcr.up || ipcr.stop || wifi_dead) {
+		lck_mtx_unlock(&ipcr_tx_lock);
+		return ENOTCONN;
+	}
+	if (ipcr.ul_failed) {
+		lck_mtx_unlock(&ipcr_tx_lock);
+		return EIO;
+	}
+	if ((ipcr.ul_wp + 1) % IPCR_ELEMENTS == ipcr.ul_rp) {   /* mhi_is_ring_full() */
+		lck_mtx_unlock(&ipcr_tx_lock);
+		say("apollo wifi: IPCR: the UL ring is full (wp %u, the chip's rp %u): a send of %lu bytes refused\n", ipcr.ul_wp, ipcr.ul_rp, length);
+		return ENOBUFS;
+	}
 	memcpy((void *)(ipcr.mem + IPCR_OFF_TX), data, length);
 	cache_flush(ipcr.mem + IPCR_OFF_TX, length);
 	element = ring + (uint64_t)ipcr.ul_wp * W2C_ELEMENT;
@@ -3408,7 +3417,13 @@ apollo_ipcr_send(const void *data, unsigned long length)
 	chan[IPCR_UL].wp = ring + (uint64_t)ipcr.ul_wp * W2C_ELEMENT;   /* mhi_ring_chan_db() */
 	ipcr_channel_db(IPCR_UL, chan[IPCR_UL].wp);
 	if (!ipcr_wait(&ipcr.tx_done, IPCR_TX_TIMEOUT_MS)) {
-		say("apollo wifi: IPCR: a send of %lu bytes was not completed in %u ms\n", length, IPCR_TX_TIMEOUT_MS);
+		/*
+		 * The chip may still read that TRE, and it points at the one bounce buffer that the next send would overwrite:
+		 * the UL channel is given up (Linux's QRTR would see the same channel stuck).
+		 */
+		ipcr.ul_failed = true;
+		say("apollo wifi: IPCR: a send of %lu bytes was not completed in %u ms: THE UL CHANNEL IS GIVEN UP, no more sends\n", length,
+		    IPCR_TX_TIMEOUT_MS);
 		error = ETIMEDOUT;
 	} else if (ipcr.tx_code != W2C_EV_CC_EOT && ipcr.tx_code != W2C_EV_CC_EOB) {
 		say("apollo wifi: IPCR: a send of %lu bytes completed with code %u\n", length, ipcr.tx_code);
@@ -3448,7 +3463,7 @@ apollo_wifi_read32(uint32_t offset)
 {
 	uint32_t value;
 
-	if (!wifi_amss || wifi_dead) {
+	if (!wifi_amss || wifi_dead || !wifi_link_alive) {
 		return ~0u;
 	}
 	lck_spin_lock(&wifi_chip_lock);
@@ -3460,7 +3475,7 @@ apollo_wifi_read32(uint32_t offset)
 void
 apollo_wifi_write32(uint32_t offset, uint32_t value)
 {
-	if (!wifi_amss || wifi_dead) {
+	if (!wifi_amss || wifi_dead || !wifi_link_alive) {
 		return;
 	}
 	lck_spin_lock(&wifi_chip_lock);
@@ -3497,24 +3512,16 @@ apollo_wifi_dma_map(void *buffer, unsigned long size, unsigned long long *iova)
 
 static volatile bool started;
 static volatile bool clocked;   /* the pcie_0 power domain and clocks are on: PARF may be touched */
-static bool wifi_downed;        /* apollo_wifi_power_down() ran: the state of W1 to W2c (tables, contexts) is not made for a second run */
+/*
+ * apollo_wifi_power_down() ran, or W2b/W2c failed and the chip was quiesced: the state of W1 to W2c (tables, contexts) is not made for
+ * a second run, so from here power up says ENOTSUP. One way: nothing clears it before the next boot.
+ */
+static bool wifi_downed;
 
-extern int apollo_qrtr_init(void) __attribute__((weak));
-int apollo_lx_prepare(void) __attribute__((weak));
-int apollo_lx_start(void) __attribute__((weak));
-
-/* weak stand-ins for when the other objects are not built in (a strong definition elsewhere wins) */
-int
-apollo_lx_prepare(void)
-{
-	return ENOSYS;
-}
-
-int
-apollo_lx_start(void)
-{
-	return ENOSYS;
-}
+/*
+ * apollo_qrtr_init (hakios.apollo_qrtr.c) and apollo_lx_prepare/start (hakios.apollo_lx.c: weak there, the apollo ath11k object's when
+ * it is linked in) are always there: both files are "standard" in bsd/conf/files (devices/mi-10t/xnu/mi-10t.patch).
+ */
 
 /* W1 up to the stage asked for (1 to 4: W2c is stage 4); 0 or an errno. With stage 4 and a success, the chip runs AMSS (wifi_amss). */
 static int
@@ -3562,6 +3569,7 @@ wifi_bring_up(uint32_t stage)
 	if (!link_on()) {
 		goto off;
 	}
+	wifi_link_alive = true;         /* (BAR0 may be touched until apollo_wifi_quiesce()) */
 	say("apollo wifi: W1 DONE: the QCA6390 is on PCIe0, link up, configuration space readable\n");
 	chip_prep = stage >= 4;         /* apollo_wifi_prep: default on from W2c, off for W2b alone */
 	PE_parse_boot_argn("apollo_wifi_prep", &chip_prep, sizeof(chip_prep));
@@ -3569,18 +3577,25 @@ wifi_bring_up(uint32_t stage)
 	error = 0;
 	if (stage >= 2 && mhi_look()) {
 		say("apollo wifi: W2a DONE: the chip's MHI and BHI registers answer through BAR0\n");
+		/*
+		 * A failed W2b or W2c: the INTIDs given back, then the chip quiesced as power down does -- PERST# and WLAN_EN down
+		 * before the SMMU context goes, so that a chip still running can not DMA through a context that is gone -- and the
+		 * state marked as power down's (wifi_downed: power up says ENOTSUP, not a second pass over half-made tables).
+		 */
 		if (stage >= 3 && !first_stage()) {
-			say("apollo wifi: W2b failed\n");
+			say("apollo wifi: W2b failed: PERST# and WLAN_EN down\n");
 			w2c_msi_stop();
-			wsmmu_off();
+			apollo_wifi_quiesce();
+			wifi_downed = true;
 			error = EIO;
 		} else if (stage >= 4) {
 			if (mission_mode()) {
 				wifi_amss = true;
 			} else {
-				say("apollo wifi: W2c failed\n");
+				say("apollo wifi: W2c failed: PERST# and WLAN_EN down\n");
 				w2c_msi_stop();
-				wsmmu_off();
+				apollo_wifi_quiesce();
+				wifi_downed = true;
 				error = EIO;
 			}
 		}
@@ -3606,12 +3621,12 @@ apollo_wifi_thread(__unused void *parameter, __unused wait_result_t result)
 
 		say("apollo wifi: stage 5: power up (W1 to W2c, IPCR): %d\n", error);
 		if (error == 0) {
-			error = apollo_qrtr_init != NULL ? apollo_qrtr_init() : ENOSYS;
+			error = apollo_qrtr_init();
 			say("apollo wifi: stage 5: apollo_qrtr_init: %d\n", error);
-			error = apollo_lx_prepare != NULL ? apollo_lx_prepare() : ENOSYS;
+			error = apollo_lx_prepare();
 			say("apollo wifi: stage 5: apollo_lx_prepare: %d\n", error);
 			if (error == 0) {
-				error = apollo_lx_start != NULL ? apollo_lx_start() : ENOSYS;
+				error = apollo_lx_start();
 				say("apollo wifi: stage 5: apollo_lx_start: %d\n", error);
 			}
 		}
@@ -3632,7 +3647,7 @@ apollo_wifi_power_up(void)
 	lck_mtx_lock(&wifi_lock);
 	if (!wifi_amss) {
 		if (wifi_downed || started) {
-			/* (started without AMSS: an earlier run stopped short or failed, and left state that a second pass is not made for) */
+			/* (started without AMSS: an earlier run stopped short (apollo_wifi < 4) or W2a failed, and left state that a second pass is not made for) */
 			error = wifi_downed ? ENOTSUP : EIO;
 		} else {
 			error = wifi_bring_up(4);
@@ -3648,22 +3663,38 @@ apollo_wifi_power_up(void)
 	return error;
 }
 
-/* The IPCR channels reset (mhi_unprepare_from_transfer(): RESET_CHAN, UL first), the threads stopped, then PERST# and the rails as quiesce does */
+#define IPCR_EXIT_WAIT_MS       30000           /* the threads' way out: an RDDM collection gives up at once, a receive function may take a while */
+
+/*
+ * The IPCR channels reset (mhi_unprepare_from_transfer(): RESET_CHAN, UL first), the threads stopped and waited for, then PERST# and
+ * WLAN_EN down as quiesce does. ipcr.up is cleared under ipcr_tx_lock: a send under way ends first, none begins after.
+ */
 void
 apollo_wifi_power_down(void)
 {
+	bool was_up;
+	uint64_t began;
+
 	lck_mtx_lock(&wifi_lock);
-	if (ipcr.up) {
-		ipcr.up = false;
+	lck_mtx_lock(&ipcr_tx_lock);
+	was_up = ipcr.up;
+	ipcr.up = false;
+	lck_mtx_unlock(&ipcr_tx_lock);
+	if (was_up) {
 		(void)ipcr_command(IPCR_UL, W2C_CMD_RESET_CHAN, "RESET_CHAN");
 		(void)ipcr_command(IPCR_DL, W2C_CMD_RESET_CHAN, "RESET_CHAN");
 	}
 	mhi_wake_release();                     /* the permanent wake assertion of W2c ends with the channels */
 	ipcr.stop = true;
-	for (unsigned ms = 0; (ipcr.event_alive || ipcr.deliver_alive) && ms < 200; ms++) {
+	/* until both threads say they are out (their last BAR access behind them), not a fixed time: PERST# under a thread at work hangs the bus */
+	for (began = now_us(); (ipcr.event_alive || ipcr.deliver_alive) && now_us() - began < IPCR_EXIT_WAIT_MS * 1000ull; ) {
 		thread_wakeup((event_t)&w2c_wake);
 		thread_wakeup((event_t)&ipcr_rx_wait);
 		sleep_ms(1);
+	}
+	if (ipcr.event_alive || ipcr.deliver_alive) {
+		say("apollo wifi: power down: THE IPCR THREADS HAVE NOT ENDED in %u ms (event %d, delivery %d): the link goes anyway "
+		    "(their BAR accesses check wifi_link_alive)\n", IPCR_EXIT_WAIT_MS, ipcr.event_alive, ipcr.deliver_alive);
 	}
 	wifi_amss = false;                      /* nothing touches the chip's registers from here */
 	if (started) {
@@ -3687,6 +3718,8 @@ apollo_wifi_quiesce(void)
 	 * loader and the log of whatever had ended the run (25 October, three runs). PERST# resets the chip's MSI anyway.
 	 */
 	w2c.msi_cap_skip = true;
+	wifi_link_alive = false;                /* the BAR writers of the IPCR threads' paths stop here */
+	__asm__ volatile ("dsb sy");
 	w2c_msi_mask();                         /* before PERST# drops: no interrupt of a chip going away */
 	/* (PARF only when it is clocked: a register of an unclocked block hangs the bus -- that ended a run) */
 	if (clocked && parf != 0) {
@@ -3709,8 +3742,8 @@ apollo_wifi_init(void)
 		return;
 	}
 	if (stage >= 5) {
-		apollo_lx_reserve(64ul << 20);
-		apollo_lx_net_early();          /* en0 before iOS's Wi-Fi side looks (wifi_station=1 with wifi_mac=) */  /* the apollo build's POOL_SIZE (devices/mi-10t/tools/mk-ath11k.sh), while memory is still in large pieces */
+		apollo_lx_reserve(64ul << 20);  /* the apollo build's POOL_SIZE (devices/mi-10t/tools/mk-ath11k.sh), while memory is still in large pieces */
+		apollo_lx_net_early();          /* en0 before iOS's Wi-Fi side looks (wifi_station=1 with wifi_mac=) */
 	}
 	if (kernel_thread_start(apollo_wifi_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
