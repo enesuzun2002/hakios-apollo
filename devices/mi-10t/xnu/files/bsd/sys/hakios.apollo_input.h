@@ -72,5 +72,8 @@ void apollo_wifi_init(void);
 void apollo_wifi_quiesce(void);         /* any way back: PERST# and WLAN_EN down (loader_return.c) */
 #include <kern/locks.h>
 extern lck_mtx_t apollo_smmu_lock;      /* the apps SMMU's match registers and contexts: whoever takes one (hakios.apollo_sound.c, hakios.apollo_pcie.c) */
+/* GCC's APCS branch vote register (0x52008) is shared by the touch, haptic, amplifier and PCIe drivers: set bits under one lock */
+void apollo_gcc_vote(vm_offset_t vote_register, uint32_t bits);         /* (hakios.apollo_cpufreq.c) */
+extern lck_mtx_t apollo_rpmh_tcs1_lock; /* RPMh's TCS 1: apollo_rpmh_bcm_vote (hakios.apollo_cpufreq.c) and the Wi-Fi's tcs_send (hakios.apollo_pcie.c) */
 
 #endif /* _SYS_APOLLO_INPUT_H_ */

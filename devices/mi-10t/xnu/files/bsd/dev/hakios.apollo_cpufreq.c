@@ -57,8 +57,9 @@ say(const char *format, ...)
  * the cores'. Left alone it stays where the boot chain put it. A vote for it goes to RPMh as Linux's interconnect
  * driver makes one (drivers/interconnect/qcom/bcm-voter.c): the BCMs of the memory controller (MC0) and its shared
  * cache (SH0) at their top, and ACV with the application processor's bit -- the same three hakios.cpufreq.c votes
- * for with ddr=2, through TCS 1 of the sequencer (TCS 0 is hakios.apollo_adsp.c's; this runs while the system starts,
- * before hakios.apollo_pcie.c's thread uses TCS 1). How fast a core reads, writes and copies is measured before and after.
+ * for with ddr=2, through TCS 1 of the sequencer (TCS 0 is hakios.apollo_adsp.c's; TCS 1 is shared with
+ * hakios.apollo_pcie.c and apollo_rpmh_bcm_vote(), each holding apollo_rpmh_tcs1_lock around it). How fast a core reads,
+ * writes and copies is measured before and after.
  */
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 
@@ -166,7 +167,8 @@ ddr_vote(uint32_t mc0, uint32_t sh0, uint32_t acv, uint32_t vote)
 
 /*
  * A vote for one bus clock manager (BCM) of RPMh by its cmd-db name, for the other apollo drivers (hakios.apollo_haptic.c: the
- * QUP wrapper 1's core clock, "QUP1", which no one but Android's geni-se driver votes for). Through TCS 1 as above;
+ * QUP wrappers' core clocks, the BCM "QUP0" -- it covers wrapper 1, whose serial engine 11 the haptic uses; cmd-db has
+ * no "QUP1" -- which no one but Android's geni-se driver votes for). Through TCS 1 as above;
  * false if RPMh has no such name or does not take the vote.
  */
 bool apollo_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib);
@@ -200,14 +202,43 @@ apollo_cmd_db_dump(void)
 }
 
 
+static LCK_GRP_DECLARE(apollo_shared_lock_group, "apollo-shared");
+LCK_MTX_DECLARE(apollo_rpmh_tcs1_lock, &apollo_shared_lock_group);
+static LCK_SPIN_DECLARE(gcc_vote_lock, &apollo_shared_lock_group);
+
+void
+apollo_gcc_vote(vm_offset_t vote_register, uint32_t bits)
+{
+	lck_spin_lock(&gcc_vote_lock);
+	*(volatile uint32_t *)vote_register |= bits;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	lck_spin_unlock(&gcc_vote_lock);
+}
+
+static bool rpmh_bcm_vote_locked(vm_offset_t rsc, const char *name, uint32_t ab, uint32_t ib);
+
 bool
 apollo_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib)
 {
-	vm_offset_t rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	static vm_offset_t rsc;         /* mapped once: ml_io_map's small submap is not given back */
+	bool done;
+
+	lck_mtx_lock(&apollo_rpmh_tcs1_lock);
+	if (rsc == 0) {
+		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	}
+	done = rsc != 0 && rpmh_bcm_vote_locked(rsc, name, ab, ib);
+	lck_mtx_unlock(&apollo_rpmh_tcs1_lock);
+	return done;
+}
+
+static bool
+rpmh_bcm_vote_locked(vm_offset_t rsc, const char *name, uint32_t ab, uint32_t ib)
+{
 	uint32_t address = cmd_db_address(name);
 	uint64_t deadline;
 
-	if (address == 0 || rsc == 0 || *(volatile uint32_t *)TCS(0x18) == 0) {
+	if (address == 0 || *(volatile uint32_t *)TCS(0x18) == 0) {
 		return false;
 	}
 	*(volatile uint32_t *)(rsc + 0xd08) = 1u << DDR_TCS;
@@ -270,6 +301,7 @@ static void
 memory_bandwidth(void)
 {
 	uint32_t enabled = 0, mc0, sh0, acv;
+	bool voted;
 
 	if (!PE_parse_boot_argn("apollo_ddr", &enabled, sizeof(enabled)) || !enabled) {
 		return;
@@ -282,7 +314,10 @@ memory_bandwidth(void)
 		return;
 	}
 	memory_speed("as found");
-	if (!ddr_vote(mc0, sh0, acv, DDR_TOP)) {
+	lck_mtx_lock(&apollo_rpmh_tcs1_lock);
+	voted = ddr_vote(mc0, sh0, acv, DDR_TOP);
+	lck_mtx_unlock(&apollo_rpmh_tcs1_lock);
+	if (!voted) {
 		say("apollo ddr: RPMh did not take the vote\n");
 		return;
 	}
@@ -312,6 +347,13 @@ memory_bandwidth(void)
 
 static vm_offset_t epss[EPSS_DOMAINS];
 static uint32_t top_row[EPSS_DOMAINS], row_now[EPSS_DOMAINS], row_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
+/*
+ * The row the heat allows each group while the display is on: the thermal thread moves it a row a second, whether the
+ * display is on or not, and apollo_cpufreq_screen() goes back to it (never higher). row_now[] and the rows themselves
+ * are set by the thermal thread and by apollo_cpufreq_screen(): set_row_locked() under cpufreq_lock.
+ */
+static uint32_t row_allowed[EPSS_DOMAINS];
+static LCK_SPIN_DECLARE(cpufreq_lock, &apollo_shared_lock_group);
 
 /* a sensor's reading in tenths of a degree, or -2730 if it has none */
 static int32_t
@@ -331,7 +373,7 @@ sensor(vm_offset_t tm, uint32_t n)
 }
 
 static void
-set_row(uint32_t domain, uint32_t row)
+set_row_locked(uint32_t domain, uint32_t row)
 {
 	if (epss[domain] == 0 || row == row_now[domain]) {
 		return;
@@ -342,25 +384,28 @@ set_row(uint32_t domain, uint32_t row)
 
 /*
  * While the display is off (apollo_cpufreq_screen(), from apollo_backlight_power()), every core group runs at its lowest
- * row: nothing is on the screen to hurry for, and the phone neither drains nor warms. Back on, they go straight to their
- * top rows again (unless the heat says otherwise, a second later).
+ * row: nothing is on the screen to hurry for, and the phone neither drains nor warms. Back on, they go straight to the
+ * rows the heat allows (row_allowed[]: the top ones unless the phone is hot).
  */
 static volatile bool screen_off;
 
 void
 apollo_cpufreq_screen(bool on)
 {
-	screen_off = !on;
+	lck_spin_lock(&cpufreq_lock);
 	/*
-	 * Back on: the top rows at once, not at the thermal thread's next second -- the first frames after the screen
+	 * Off -> on: the allowed rows at once, not at the thermal thread's next second -- the first frames after the screen
 	 * comes back are drawn (and copied to the panel by the processors) right away, and at the screen-off rows they came
-	 * out torn (25 October). The thermal thread takes over from there (and says so) on its next pass.
+	 * out torn (25 October). The thermal thread takes over from there (and says so) on its next pass. A repeated "on"
+	 * changes nothing: the rows stay where the heat has put them.
 	 */
-	if (on) {
+	if (on && screen_off) {
 		for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
-			set_row(domain, top_row[domain]);
+			set_row_locked(domain, row_allowed[domain]);
 		}
 	}
+	screen_off = !on;
+	lck_spin_unlock(&cpufreq_lock);
 }
 
 static void
@@ -371,43 +416,67 @@ apollo_thermal_thread(__unused void *parameter, __unused wait_result_t result)
 	static const uint8_t cpu_sensors[] = { 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14 };
 	vm_offset_t tm0 = ml_io_map(TSENS0_TM_PHYS, 0x1000), tm1 = ml_io_map(TSENS1_TM_PHYS, 0x1000);
 	int32_t hottest_seen = -2730;
+	bool blind_said = false;
 
 	for (uint32_t tick = 0;; tick++) {
-		int32_t cpu = -2730, gpu, ddr, hottest;
+		int32_t cpu = -2730, gpu = -2730, ddr = -2730, hottest;
+		bool off;
 
-		for (unsigned i = 0; i < sizeof(cpu_sensors); i++) {
+		/* (an unmapped sensor block reads as no sensor: sensor() is not given a 0 base) */
+		for (unsigned i = 0; tm0 != 0 && i < sizeof(cpu_sensors); i++) {
 			int32_t t = sensor(tm0, cpu_sensors[i]);
 
 			cpu = t > cpu ? t : cpu;
 		}
-		gpu = sensor(tm0, 15);
-		gpu = sensor(tm1, 8) > gpu ? sensor(tm1, 8) : gpu;
-		ddr = sensor(tm1, 3);
+		if (tm0 != 0) {
+			gpu = sensor(tm0, 15);
+		}
+		if (tm1 != 0) {
+			int32_t t = sensor(tm1, 8);
+
+			gpu = t > gpu ? t : gpu;
+			ddr = sensor(tm1, 3);
+		}
 		hottest = cpu > gpu ? cpu : gpu;
 		hottest = ddr > hottest ? ddr : hottest;
 		hottest_seen = hottest > hottest_seen ? hottest : hottest_seen;
 
-		if (screen_off != was_off) {
-			was_off = screen_off;
+		/*
+		 * The rows the heat allows. No core sensor that reads is no reason to think the cores cool: then every group
+		 * is held at the middle of its table at most (and not raised) until one reads again.
+		 */
+		lck_spin_lock(&cpufreq_lock);
+		if (cpu == -2730) {
 			for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
-				set_row(domain, was_off ? 0 : top_row[domain]);
+				row_allowed[domain] = row_allowed[domain] > top_row[domain] / 2 ? top_row[domain] / 2 : row_allowed[domain];
 			}
-			say("apollo thermal: the display is %s: the cores at %u, %u, %u MHz\n", was_off ? "off" : "on",
-			    row_khz[0][row_now[0]] / 1000, row_khz[1][row_now[1]] / 1000, row_khz[2][row_now[2]] / 1000);
-		}
-		if (was_off) {
-			/* the lowest rows stay */
 		} else if (hottest >= THERMAL_HOT) {
 			for (uint32_t domain = 1; domain < EPSS_DOMAINS; domain++) {
-				set_row(domain, row_now[domain] > 0 ? row_now[domain] - 1 : 0);
+				row_allowed[domain] = row_allowed[domain] > 0 ? row_allowed[domain] - 1 : 0;
 			}
 			if (hottest >= THERMAL_HOTTER) {
-				set_row(0, row_now[0] > 0 ? row_now[0] - 1 : 0);
+				row_allowed[0] = row_allowed[0] > 0 ? row_allowed[0] - 1 : 0;
 			}
 		} else if (hottest < THERMAL_COOL) {
 			for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
-				set_row(domain, row_now[domain] < top_row[domain] ? row_now[domain] + 1 : top_row[domain]);
+				row_allowed[domain] = row_allowed[domain] < top_row[domain] ? row_allowed[domain] + 1 : top_row[domain];
 			}
+		}
+		/* while the display is off the lowest rows stay; on, the allowed ones */
+		off = screen_off;
+		for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
+			set_row_locked(domain, off ? 0 : row_allowed[domain]);
+		}
+		lck_spin_unlock(&cpufreq_lock);
+		if (off != was_off) {
+			was_off = off;
+			say("apollo thermal: the display is %s: the cores at %u, %u, %u MHz\n", was_off ? "off" : "on",
+			    row_khz[0][row_now[0]] / 1000, row_khz[1][row_now[1]] / 1000, row_khz[2][row_now[2]] / 1000);
+		}
+		if ((cpu == -2730) != blind_said) {
+			blind_said = !blind_said;
+			say("apollo thermal: %s\n", blind_said ? "NO CORE SENSOR READS: the cores held at the middle of their tables" :
+			    "the core sensors read again");
 		}
 		if (tick % 30 == 0) {
 			say("apollo thermal: cores %d.%d, GPU %d.%d, memory %d.%d degrees (hottest so far %d.%d); speeds %u, %u, %u MHz\n",
@@ -449,7 +518,7 @@ apollo_cpufreq_init(void)
 			row_khz[domain][row] = khz;
 		}
 		epss[domain] = base;
-		top_row[domain] = row_now[domain] = top;
+		top_row[domain] = row_now[domain] = row_allowed[domain] = top;
 		was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 		*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
 		delay_for_interval(20, NSEC_PER_MSEC);

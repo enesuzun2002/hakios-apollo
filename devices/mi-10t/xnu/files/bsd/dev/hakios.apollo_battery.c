@@ -12,7 +12,10 @@
  * as hakios.apollo_backlight.c reaches it; a write only goes through a channel that system 0 owns): 1 logs its registers
  * (charge state, limits, power path, APSD, USBIN) once a minute and when the loader's charger_present changes; 2 also,
  * every five seconds while a cable is in, pets its watchdog (whose bite disables charging) and clears a USBIN suspend,
- * a disabled charge enable and a charge pause. No limit (ICL, FCC, FV) is written.
+ * a disabled charge enable and a charge pause; 3 also sets the input and charge currents (chg_currents()). None of
+ * that is written unless the loader's page is fresh (its `polls` advanced within CHG_FRESH_SECONDS) and the battery's
+ * temperature it gives is a real one: a loader that has stopped polling, or a gauge that gives no temperature, leaves
+ * the charger to its own watchdog, whose bite stops the charging.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -114,7 +117,15 @@ snapshot(struct loader_battery *out)
 	return false;
 }
 
+static int32_t
+clamp32(int64_t value)
+{
+	return value > 0x7fffffffLL ? 0x7fffffff : value < -0x80000000LL ? (int32_t)(-0x7fffffff - 1) : (int32_t)value;
+}
+
 /* ---- the PM8150B's charger (Linux's qcom-smb5; boot-arg apollo_charger=N) -------------------------------- */
+
+#define CHG_FRESH_SECONDS       15ULL           /* three of the loader's polls */
 
 /*
  * The charger is SPMI slave 2 (the PM8150B): peripherals 0x10 CHGR, 0x11 DCDC, 0x13 USBIN, 0x14 DCIN, 0x15 TYPEC and
@@ -387,8 +398,24 @@ chg_log(void)
 #define CHG_ICL_MAX_MA          3000            /* qcom,usb-icl-ua */
 #define CHG_FCC_MA              2000            /* mi,fcc-batt-unverify-ua */
 
+/*
+ * What the charger may be told depends on the battery's temperature, JEITA-like (the cell's own limits are not known
+ * here; these are the usual ones for a phone's Li-ion cell): under 0 degrees no charging should happen at all, so
+ * chg_fix() does not re-enable it and chg_currents() puts both currents at the floor (500 mA); 0..9 degrees the
+ * battery's current is held to 1 A (a cool cell takes less); 10..44 the full currents; from 45 the reduced ones below,
+ * and above 45 chg_fix() no longer re-enables charging or pets the watchdog either -- the charger's own protection
+ * decides. A temperature outside CHG_TEMP_SANE_* (the loader's -273 "unknown", or garbage) is no temperature: then
+ * the currents go to the floor and chg_fix() does nothing.
+ */
+#define CHG_TEMP_SANE_MIN       (-40)
+#define CHG_TEMP_SANE_MAX       100
+#define CHG_TEMP_COLD           0               /* below: no charging */
+#define CHG_TEMP_COOL           10              /* below: the battery's current at most 1 A */
+#define CHG_TEMP_WARM           45              /* from: reduced currents; above: no repairs */
+#define CHG_FLOOR_MA            500
+
 static void
-chg_currents(void)
+chg_currents(bool temperature_valid, int temperature_c)
 {
 	static uint32_t told_icl = ~0u, told_fcc = ~0u;
 	uint8_t snk = 0, apsd = 0, raw = 0;
@@ -409,10 +436,16 @@ chg_currents(void)
 	} else {
 		icl = 500, why = "a plain USB port";
 	}
-	if (apollo_battery_temperature_c >= 50) {
+	if (!temperature_valid) {
+		icl = CHG_FLOOR_MA, fcc = CHG_FLOOR_MA, why = "THE BATTERY'S TEMPERATURE IS NOT KNOWN";
+	} else if (temperature_c < CHG_TEMP_COLD) {
+		icl = CHG_FLOOR_MA, fcc = CHG_FLOOR_MA, why = "THE BATTERY IS BELOW 0 DEGREES";
+	} else if (temperature_c >= 50) {
 		icl = 500, fcc = 1000, why = "THE BATTERY IS AT 50 DEGREES OR MORE";
-	} else if (apollo_battery_temperature_c >= 45) {
+	} else if (temperature_c >= CHG_TEMP_WARM) {
 		icl = icl > 1000 ? 1000 : icl, fcc = 1000, why = "the battery is at 45 degrees or more";
+	} else if (temperature_c < CHG_TEMP_COOL) {
+		fcc = 1000, why = "the battery is below 10 degrees";
 	}
 	icl = icl > CHG_ICL_MAX_MA ? CHG_ICL_MAX_MA : icl;
 	if (chg_read(0x1370, &raw) == NULL && raw != icl / CHG_ICL_STEP_MA) {
@@ -423,8 +456,8 @@ chg_currents(void)
 	}
 	if (chg_read(0x1061, &raw) == NULL && raw != fcc / CHG_ICL_STEP_MA) {
 		if (chg_write(0x1061, (uint8_t)(fcc / CHG_ICL_STEP_MA)) == NULL && told_fcc != fcc) {
-			say("apollo charger: the battery's current %u -> %u mA (battery at %d degrees)\n", raw * CHG_ICL_STEP_MA, fcc,
-			    apollo_battery_temperature_c);
+			say("apollo charger: the battery's current %u -> %u mA (battery at %d degrees%s)\n", raw * CHG_ICL_STEP_MA, fcc,
+			    temperature_c, temperature_valid ? "" : ", not a real temperature");
 			told_fcc = fcc;
 		}
 	}
@@ -508,9 +541,33 @@ apollo_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	int gauge = -1, shown = -1;     /* the fuel gauge's last own answer; what iOS was last given */
 	bool was_estimate = false;
 	int last_charger = -1;
+	/*
+	 * Whether the loader still polls: its `polls` must have advanced within CHG_FRESH_SECONDS (it polls every five
+	 * seconds while the UEFI's storage stack is in) for anything to be written to the charger. Until it is first seen
+	 * to advance, the page counts as stale.
+	 */
+	uint32_t last_polls = shared->polls;
+	uint64_t last_advance = 0, fresh_interval;
+	bool fresh = false, was_fresh = false;
+	bool temperature_valid = false;         /* from this tick's snapshot only: never an old value */
+	int temperature_c = -273;
 
+	nanoseconds_to_absolutetime(CHG_FRESH_SECONDS * NSEC_PER_SEC, &fresh_interval);
 	for (unsigned tick = 0;; tick++) {
-		if (!snapshot(&b) || !(b.flags & LOADER_BATTERY_VALID)) {
+		bool got = snapshot(&b);
+
+		temperature_valid = false;
+		if (got && b.polls != last_polls) {
+			last_polls = b.polls;
+			last_advance = mach_absolute_time();
+		}
+		fresh = last_advance != 0 && mach_absolute_time() - last_advance < fresh_interval;
+		if (chg_ready && chg_level >= 2 && fresh != was_fresh) {
+			say("apollo charger: the loader's page is %s\n", fresh ? "fresh again: repairs resume" :
+			    "STALE (the loader has stopped polling): no writes to the charger, its watchdog is no longer petted");
+		}
+		was_fresh = fresh;
+		if (!got || !(b.flags & LOADER_BATTERY_VALID)) {
 			misses++;
 		} else {
 			apollo_battery_soc = b.soc_percent < 0 ? 0 : b.soc_percent > 100 ? 100 : b.soc_percent;
@@ -533,6 +590,8 @@ apollo_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			apollo_battery_voltage_mv = (b.flags & LOADER_BATTERY_VOLTAGE_VALID) ? b.voltage_mv : -1;
 			apollo_battery_current_ma = b.current_ma;
 			apollo_battery_temperature_c = b.temperature_c;
+			temperature_valid = fresh && b.temperature_c >= CHG_TEMP_SANE_MIN && b.temperature_c <= CHG_TEMP_SANE_MAX;
+			temperature_c = b.temperature_c;
 			apollo_battery_present = (b.flags & LOADER_BATTERY_PRESENT) != 0;
 			apollo_battery_charger = (b.flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
 			apollo_battery_charging = (b.flags & LOADER_BATTERY_CHARGING) != 0;
@@ -546,8 +605,9 @@ apollo_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			 * The power source wants more than 0 while charging. Which sign Qualcomm's driver gives a charging current
 			 * is not settled on this phone: while charging, its magnitude is taken; otherwise its negative.
 			 */
-			state.current_ua = (apollo_battery_charging ? 1 : -1) * (b.current_ma < 0 ? -b.current_ma : b.current_ma) * 1000;
-			state.temperature_hundredths = b.temperature_c * 100;
+			state.current_ua = clamp32((apollo_battery_charging ? 1 : -1) *
+			    (b.current_ma < 0 ? -(int64_t)b.current_ma : (int64_t)b.current_ma) * 1000);
+			state.temperature_hundredths = clamp32((int64_t)b.temperature_c * 100);
 			/* the firmware's charger driver answered: there is a battery, whatever its presence call said */
 			state.present = 1;
 			state.external = apollo_battery_charger;
@@ -572,11 +632,13 @@ apollo_battery_thread(__unused void *parameter, __unused wait_result_t result)
 				chg_log();
 			}
 			last_charger = apollo_battery_charger;
-			if (chg_level >= 2) {
+			/* a stale page: nothing written at all, and the watchdog left to bite */
+			if (chg_level >= 2 && fresh && temperature_valid && temperature_c >= CHG_TEMP_COLD &&
+			    temperature_c <= CHG_TEMP_WARM) {
 				chg_fix();
 			}
-			if (chg_level >= 3 && apollo_battery_charger) {
-				chg_currents();
+			if (chg_level >= 3 && fresh && apollo_battery_charger) {
+				chg_currents(temperature_valid, temperature_c);
 			}
 		}
 		delay_for_interval(5000, NSEC_PER_MSEC);
@@ -596,6 +658,10 @@ apollo_battery_init(void)
 	}
 	if (!PE_parse_boot_argn("battery_shared_pa", &pa, sizeof(pa)) || pa == 0) {
 		printf("apollo battery: the loader gave no battery_shared_pa (is it a loader that knows apollo_battery=1?)\n");
+		return;
+	}
+	if ((pa & (LOADER_PAGE_SIZE - 1)) + sizeof(struct loader_battery) > LOADER_PAGE_SIZE) {
+		printf("apollo battery: battery_shared_pa %#llx: the page's struct would run past its 16 KB mapping\n", pa);
 		return;
 	}
 	page = ml_io_map((vm_offset_t)(pa & ~(LOADER_PAGE_SIZE - 1)), LOADER_PAGE_SIZE);

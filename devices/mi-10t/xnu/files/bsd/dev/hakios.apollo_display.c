@@ -36,7 +36,8 @@
  *    SMMU stream of the display), with the pipe that scans the boot framebuffer marked.
  *  - apollo_display_flip(phys, stride) / apollo_display_flip_latched(): the pipe's SRC0_ADDR is written and the pipe's bit
  *    in CTL_FLUSH set; the hardware takes the new address at the next frame's start and clears the bit.
- *  - apollo_flip_test=S: 20 s after the init, two buffers (red, green) are flipped between for S seconds and timed.
+ *  - apollo_flip_test=S: 20 s after the init, two buffers (red, green) are flipped between for S seconds and timed (not with
+ *    apollo_flip=1, whose frames they are).
  * The catalog offsets of Linux (catalog/dpu_6_0_sm8250.h) are relative to 0x0ae01000 (its ctl_0 is at 0x1000, and the CTL
  * here is at 0x0ae02000); the device tree's mdss_mdp reg "mdp_phys" is 0x0ae00000, size 0x84208, and its qcom,sde-sspp-off
  * (0x5000 0x7000 0x9000 0xb000 0x25000 0x27000 0x29000 0x2b000), qcom,sde-ctl-off (0x2000 + 0x200 n) and qcom,sde-mixer-off
@@ -72,7 +73,6 @@ extern void loader_log_putc(char c);
 void apollo_display_init(void);
 uint32_t apollo_display_hz(void);
 bool apollo_display_wait_scanout(uint64_t max_ns);
-void apollo_display_stats(uint32_t *waits, uint64_t *wait_ns_total);
 bool apollo_display_flip(uint64_t phys, uint32_t stride);
 bool apollo_display_flip_latched(void);
 int apollo_scanout_get(unsigned *count, vm_offset_t va[3], uint64_t pa[3], uint32_t *stride);
@@ -165,9 +165,6 @@ static uint32_t hsync_period;           /* pixel clocks to a line */
 static uint32_t frame_lines;            /* lines to a frame, as the registers have it now */
 static uint32_t active_start_line, active_end_line;
 static uint32_t measured_mhz;           /* the refresh rate in millihertz, measured */
-
-static uint32_t wait_count;
-static uint64_t wait_total_ns;
 
 /* the rate in tenths of a hertz, rounded, for the log */
 static uint32_t
@@ -411,22 +408,7 @@ apollo_display_wait_scanout(uint64_t max_ns)
 			}
 		}
 	}
-	now = mach_absolute_time();
-	absolutetime_to_nanoseconds(now - start, &limit);
-	wait_count++;
-	wait_total_ns += limit;
 	return found;
-}
-
-void
-apollo_display_stats(uint32_t *waits, uint64_t *wait_ns_total)
-{
-	if (waits != NULL) {
-		*waits = wait_count;
-	}
-	if (wait_ns_total != NULL) {
-		*wait_ns_total = wait_total_ns;
-	}
 }
 
 /* ---- the DPU: source pipes, CTLs, mixers (apollo_dpu_dump=1), and the page flip -------------------------- */
@@ -1059,11 +1041,7 @@ flip_test_thread(void *arg, wait_result_t wr_)
 restore:
 	restore_original(orig_stride);
 out:
-	for (i = 0; i < 2; i++) {
-		if (buf[i] != 0 && !flip_reserved) {
-			kmem_free(kernel_map, buf[i], bytes);
-		}
-	}
+	/* (the buffers are flip_reserve()'s mappings of the display's reservation: kept, never given to kmem_free) */
 	thread_terminate(current_thread());
 }
 
@@ -1356,7 +1334,10 @@ apollo_display_init(void)
 	if ((test != 0 || flip_mode == 1) && flip_ready()) {
 		flip_reserve();
 	}
-	if (test != 0 && test <= 600) {
+	if (test != 0 && flip_mode == 1) {
+		/* the test flips between frames 1 and 2 of the reservation, which apollo_flip=1 draws into and scans out */
+		say("apollo display: apollo_flip_test=%u is not run with apollo_flip=1 (the two share the frames)\n", test);
+	} else if (test != 0 && test <= 600) {
 		thread_t thread;
 
 		flip_test_seconds = test < 2 ? 2 : test;

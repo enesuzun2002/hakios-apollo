@@ -95,6 +95,12 @@ wr(vm_offset_t address, uint32_t value)
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
 static LCK_GRP_DECLARE(apollo_backlight_grp, "apollo-backlight");
 static LCK_SPIN_DECLARE(apollo_backlight_lock, &apollo_backlight_grp);
+/*
+ * The brightness's state (level, lit, wanted_fraction, what the sysctls show) and the writes that change it: iOS's
+ * brightness (IOMFB's property, or the sysctl from backboardd), the display's power and the run's end come from
+ * different threads, each through write_level() under this. (The spin lock above is only around one transfer.)
+ */
+static LCK_MTX_DECLARE(apollo_backlight_state_lock, &apollo_backlight_grp);
 
 struct peripheral {
 	const char *name;
@@ -334,19 +340,23 @@ apollo_backlight_set(uint32_t fraction)
 	if (!ready) {
 		return;
 	}
+	lck_mtx_lock(&apollo_backlight_state_lock);
 	wanted_fraction = fraction > 0x10000 ? 0x10000 : fraction;
 	if (lit) {
 		write_level(level_for(wanted_fraction));
 	}
+	lck_mtx_unlock(&apollo_backlight_state_lock);
 }
 
 /* the display is switched off (the light with it) or on again (at the brightness that was last asked for) */
 void
 apollo_backlight_power(bool on)
 {
+	lck_mtx_lock(&apollo_backlight_state_lock);
 	apollo_touch_screen(on);        /* the touch follows the screen, with or without the backlight driver */
 	apollo_cpufreq_screen(on);      /* and the cores slow down while it is off */
 	if (!ready || on == lit) {
+		lck_mtx_unlock(&apollo_backlight_state_lock);
 		return;
 	}
 	if (on) {
@@ -354,6 +364,7 @@ apollo_backlight_power(bool on)
 	} else {
 		write_level(0);
 	}
+	lck_mtx_unlock(&apollo_backlight_state_lock);
 	say("apollo backlight: the display is %s\n", on ? "on" : "off");
 }
 
@@ -364,7 +375,9 @@ void
 apollo_backlight_stop(void)
 {
 	if (ready) {
+		lck_mtx_lock(&apollo_backlight_state_lock);
 		write_level(level_found != 0 ? level_found : maximum / 2);
+		lck_mtx_unlock(&apollo_backlight_state_lock);
 	}
 }
 
@@ -378,8 +391,18 @@ static int
 sysctl_backlight_percent(__unused struct sysctl_oid *oid, __unused void *arg1, __unused int arg2,
     struct sysctl_req *req)
 {
-	int value = percent_shown, error = sysctl_handle_int(oid, &value, 0, req);
+	int value, error;
 
+	/*
+	 * The sysctl is compiled into every phone's kernel: where the Mi 10T's backlight is not driven (another phone, or
+	 * the WLED not as expected) it says so, read or written -- userland/src/inject.c's brightness_slider() takes any
+	 * error from reading it as "no backlight of ours" and installs nothing.
+	 */
+	if (!ready) {
+		return ENODEV;
+	}
+	value = percent_shown;
+	error = sysctl_handle_int(oid, &value, 0, req);
 	if (error == 0 && req->newptr != USER_ADDR_NULL) {
 		if (value < 0 || value > 100) {
 			return EINVAL;
@@ -388,7 +411,7 @@ sysctl_backlight_percent(__unused struct sysctl_oid *oid, __unused void *arg1, _
 	}
 	return error;
 }
-/* (anybody may set it: the brightness slider is backboardd's, which runs as mobile) */
+/* (anybody may set it: the brightness slider is backboardd's, which runs as mobile -- userland/src/inject.c) */
 SYSCTL_PROC(_kern_apollo, OID_AUTO, backlight, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
     sysctl_backlight_percent, "I", "the backlight, 0 to 100 percent (a perceived scale)");
 

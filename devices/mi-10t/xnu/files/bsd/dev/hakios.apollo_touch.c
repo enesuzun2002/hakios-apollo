@@ -204,7 +204,7 @@ branch_status(vm_offset_t cbcr)
 static bool
 clocks_on(void)
 {
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP0_CORE_2X | VOTE_QUP0_CORE | VOTE_QUP0_M_AHB | VOTE_QUP0_S_AHB);
+	apollo_gcc_vote(GCC_VOTE, VOTE_QUP0_CORE_2X | VOTE_QUP0_CORE | VOTE_QUP0_M_AHB | VOTE_QUP0_S_AHB);
 	if (rd(GCC_QUP0_SE4_DFSR) & 1) {
 		for (uint32_t level = 0; level < 8; level++) {
 			uint32_t hz = rcg_rate(rd(GCC_QUP0_SE4_PERF_CFG(level)), rd(GCC_QUP0_SE4_PERF_M(level)),
@@ -232,7 +232,7 @@ clocks_on(void)
 		se_source_hz = XO_HZ;
 		se_clock_select = 0;
 	}
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP0_SE4);
+	apollo_gcc_vote(GCC_VOTE, VOTE_QUP0_SE4);
 	for (int i = 0; i < 1000; i++) {
 		if (!((rd(GCC_QUP0_M_AHB_CBCR) | branch_status(GCC_QUP0_S_AHB_CBCR) | rd(GCC_QUP0_SE4_CBCR)) & CLOCK_OFF)) {
 			return true;
@@ -626,27 +626,6 @@ apollo_nvt_report(const uint8_t *data, uint32_t blocks)
 	}
 }
 
-static void
-apollo_nvt_poll(void)
-{
-	static uint8_t report[NVT_POINT_DATA_LEN + 2];
-	static unsigned bad;
-
-	seen.polls++;
-	if (!nvt_read(NVT_EVENT_BUF_ADDR, report, NVT_POINT_DATA_LEN + 1)) {
-		seen.bad++;
-		if (bad++ < 8) {
-			printf("apollo: the touch report cannot be read\n");
-		}
-		return;
-	}
-	seen.reports++;
-	if (report[0] == 0xff && report[1] == 0xff) {
-		return;
-	}
-	apollo_nvt_report(report, NVT_POINT_DATA_LEN / 6);
-}
-
 /* ---- the chip's firmware -------------------------------------------------------------------------- */
 
 /*
@@ -725,7 +704,7 @@ static uint32_t nvt_parts;
 static const char *
 nvt_parse_firmware(const uint8_t *fw, uint64_t size)
 {
-	uint32_t end, info = 0, overlays;
+	uint32_t end, info, overlays;
 
 	if (size < 0x20000 || memcmp(fw + 0x20000 - 3, "NVT", 3) != 0) {
 		return "has no \"NVT\" end flag at 128 KiB";
@@ -733,10 +712,12 @@ nvt_parse_firmware(const uint8_t *fw, uint64_t size)
 	if (fw[0x20000 - 0x1000] + fw[0x20000 - 0x1000 + 1] != 0xff) {
 		return "has a broken version";
 	}
+	/* (the info sections run from 0x30 to `end`: within the file, or the file is not believed) */
 	end = le32(fw);
-	for (uint32_t pos = 0x30; pos < end; pos += 0x10) {
-		info++;
+	if (end > size) {
+		return "has a section table beyond its end";
 	}
+	info = end > 0x30 ? (uint32_t)(((uint64_t)end - 0x30 + 0xf) / 0x10) : 0;
 	overlays = (fw[0x28] & 0x10) ? (fw[0x28] & 0x0f) : 0;
 	nvt_parts = 2 + info + overlays;
 	if (nvt_parts > NVT_MAX_PARTITIONS) {
@@ -749,7 +730,9 @@ nvt_parse_firmware(const uint8_t *fw, uint64_t size)
 			nvt_part[i].size = le32(fw + 12 * i + 8);
 			nvt_part[i].crc = le32(fw + 0x18 + 4 * i);
 		} else {
-			uint32_t pos = i < 2 + info ? 0x30 + 0x10 * (i - 2) : nvt_part[1].bin + 0x10 * (i - 2 - info);
+			/* (in 64 bits: an overlay's place comes from DLM's offset, which the file says, sized or not) */
+			uint64_t pos = i < 2 + info ? 0x30 + 0x10 * (uint64_t)(i - 2) :
+			    (uint64_t)nvt_part[1].bin + 0x10 * (uint64_t)(i - 2 - info);
 
 			if (pos + 16 > size) {
 				return "has a section table beyond its end";
@@ -906,17 +889,15 @@ apollo_touch_show_state(const char *when)
 
 /*
  * The screen follows iOS (apollo_backlight_power -> apollo_touch_screen): the caller only records the wanted state and
- * wakes the thread, which does the SPI work.
+ * wakes the thread, which does the SPI work. A request that comes before the thread has started (or without a touch
+ * thread at all) is kept: the thread's loop looks at the wanted state first, so a screen switched off before the touch
+ * was up puts the chip to sleep as soon as it is.
  */
 static volatile bool touch_screen_wanted = true;
-static volatile bool touch_started;
 
 void
 apollo_touch_screen(bool on)
 {
-	if (!touch_started) {
-		return;
-	}
 	touch_screen_wanted = on;
 	thread_wakeup((event_t)&touch_screen_wanted);
 }
@@ -1062,7 +1043,6 @@ apollo_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	nanoseconds_to_absolutetime(45 * NSEC_PER_MSEC, &lifted);
 	nanoseconds_to_absolutetime(1500 * NSEC_PER_MSEC, &esd_quiet);
 	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &status_every);
-	touch_started = true;
 	for (;;) {
 		if (!touch_screen_wanted) {
 			apollo_touch_sleep();
