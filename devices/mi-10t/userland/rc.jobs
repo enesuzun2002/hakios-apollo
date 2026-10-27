@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.hakios.demo (see userland/com.hakios.demo.plist), on the Mi 10T (apollo):
+# build the images with RC_JOBS=../devices/mi-10t/userland/rc.jobs (devices/mi-10t/README.md). No start-up sounds:
+# the speakers are known to work.
+/bin/ps -A

@@ -442,6 +442,11 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
+# ... and each phone's own firmware, by that phone's script (devices/<name>/userland/firmware.sh, read here with
+# root/ the small image being made): what it needs, from its own ../fw-*-<name> directories into root/fw
+for f in ../devices/*/userland/firmware.sh; do
+	if [ -f "$f" ]; then . "$f"; fi
+done
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
 # slot on 19 October 2026. It is the vendor's and never in the repository, so a copy made with bare
