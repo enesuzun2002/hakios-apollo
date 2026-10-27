@@ -1920,11 +1920,12 @@ scan_setup(void)
 	if (scan_call(&scan.info) != 0 || scan.info.count != 3 || scan.info.width == 0 || scan.info.height == 0) {
 		say("hakios-gl: apollo_gpu_present: the kernel has no panel frames to draw into (apollo_flip=1 and "
 		    "apollo_gpu_present=1 are both wanted)\n");
-		return false;
+		goto fail;
 	}
 	if ((scan.gl = hakios_gl_create(3)) == NULL || !hakios_gl_make_current(scan.gl)) {
 		say("hakios-gl: apollo_gpu_present: no context of our own\n");
-		return false;
+		hakios_gl_make_current(previous);       /* (a failed switch may have left none current) */
+		goto fail;
 	}
 	glGenFramebuffers(1, &scan.reader);
 	ok = true;
@@ -1948,8 +1949,17 @@ scan_setup(void)
 		scan.state = 1;
 		say("hakios-gl: apollo_gpu_present: the panel's frames (%ux%u, rows of %u bytes) are render targets; the display is %ux%u\n",
 		    scan.info.width, scan.info.height, scan.info.stride, scan.info.display_width, scan.info.display_height);
+		return true;
 	}
-	return ok;
+fail:
+	/* not available, and it stays so (state -1): nothing of it is kept */
+	if (scan.gl != NULL) {
+		hakios_gl_destroy(scan.gl);     /* (its textures and framebuffers with it) */
+		scan.gl = NULL;
+	}
+	IOServiceClose(scan.connection);
+	scan.connection = 0;
+	return false;
 }
 
 /* The texture of a surface to scale from (the one the GL context in use has, bound to nothing); 0: not one. With scan.gl current. */
