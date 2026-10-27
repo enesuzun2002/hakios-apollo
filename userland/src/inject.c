@@ -218,6 +218,7 @@ my_render_update(void *server, void *update, unsigned *flags)
 #define VT_GLES_CONTEXT         0x1d5b3b540UL   /* vtable for CA::OGL::GLESContext */
 
 static int gl_loaded;                           /* CoreAnimation draws with OpenGL ES (opengl_es() below) */
+static int (*gl_scan)(const void *swap);        /* boot-arg apollo_gpu_present=1: the final scale on the GPU (src/eagl.c, hakios_gl_scan) */
 static void (*gl_function_refused)(unsigned function);  /* our OpenGL ES library keeps count (eagl.c, the census) */
 static int (*orig_function_supported)(void *context);
 
@@ -1019,6 +1020,51 @@ container_manager_fixes(void)
 	say("hakios: container manager: no personas\n");
 }
 
+/* ---- backboardd: the final scale of a frame on the GPU (boot-arg apollo_gpu_present=1) ------------------------ */
+
+/*
+ * IOMobileFramebufferSwapEnd sends the display's driver one request: IOConnectCallMethod (or ...StructMethod) with selector 5
+ * (the driver's kFBMethodSwapEnd) and a structure of 0x46c bytes, the swap, which has the number of the swap (the word at 0x50), its
+ * surfaces (0x54 + 4 * layer), and rectangles (iokit/Kernel/MiniIOMobileFramebuffer.cpp, SWAP_*). Interposed here (dyld's
+ * __interpose, as inject_fairplay.c does). That does NOT reach QuartzCore's and IOMobileFramebuffer's own calls, which are bound inside the
+ * shared cache (run 215116: never called), so the frames that matter are taken at the end of CoreAnimation's own frame instead
+ * (eagl.c, scan_frame(), which marks them to the kernel by surface); this stays for any caller outside the cache, and stands aside once
+ * that road works. Where it is called, the request is first shown to hakios_gl_scan() in libhakios.gl.dylib: if it is a frame the GPU can scale into one of the panel's
+ * frames, that is done and the kernel told, and the request itself goes on to the kernel unchanged. Everything else, in this or any
+ * other program, is passed through untouched; with the boot-arg off (or no library) gl_scan is NULL and nothing else happens.
+ */
+#define FB_SWAP_END_SELECTOR    5
+#define FB_SWAP_END_SIZE        0x46c
+
+static kern_return_t
+my_IOConnectCallMethod(mach_port_t connection, uint32_t selector, const uint64_t *input, uint32_t inputCnt,
+    const void *inputStruct, size_t inputStructCnt, uint64_t *output, uint32_t *outputCnt, void *outputStruct,
+    size_t *outputStructCnt)
+{
+	if (gl_scan != NULL && selector == FB_SWAP_END_SELECTOR && inputStruct != NULL && inputStructCnt == FB_SWAP_END_SIZE) {
+		gl_scan(inputStruct);
+	}
+	return IOConnectCallMethod(connection, selector, input, inputCnt, inputStruct, inputStructCnt, output, outputCnt,
+	    outputStruct, outputStructCnt);
+}
+
+static kern_return_t
+my_IOConnectCallStructMethod(mach_port_t connection, uint32_t selector, const void *inputStruct, size_t inputStructCnt,
+    void *outputStruct, size_t *outputStructCnt)
+{
+	if (gl_scan != NULL && selector == FB_SWAP_END_SELECTOR && inputStruct != NULL && inputStructCnt == FB_SWAP_END_SIZE) {
+		gl_scan(inputStruct);
+	}
+	return IOConnectCallStructMethod(connection, selector, inputStruct, inputStructCnt, outputStruct, outputStructCnt);
+}
+
+__attribute__((used)) static struct {
+	const void *ours, *theirs;
+} swap_interposed[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)my_IOConnectCallMethod, (const void *)IOConnectCallMethod },
+	{ (const void *)my_IOConnectCallStructMethod, (const void *)IOConnectCallStructMethod },
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 
 /*
@@ -1058,6 +1104,9 @@ opengl_es(void)
 	}
 	if (wanted < 0) {
 		gpu = IOServiceGetMatchingService(0, IOServiceMatching("HakiosGPU"));
+		if (gpu == 0) {
+			gpu = IOServiceGetMatchingService(0, IOServiceMatching("ApolloGPU"));       /* the Mi 10T's: same interface */
+		}
 		wanted = gpu != 0;
 		if (gpu != 0) {
 			IOObjectRelease(gpu);
@@ -1072,6 +1121,11 @@ opengl_es(void)
 		return;
 	}
 	gl_loaded = 1;
+	if (strstr(arguments, "apollo_gpu_present=1") != NULL) {
+		gl_scan = (int (*)(const void *))dlsym(library, "hakios_gl_scan");
+		say("hakios: apollo_gpu_present=1: swaps are %s\n", gl_scan ? "scaled to the panel by the GPU where they can be" :
+		    "not scaled by the GPU (the library has no hakios_gl_scan)");
+	}
 	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(library,
 	    "hakios_gl_function_values");
 	gl_function_refused = (void (*)(unsigned))dlsym(library, "hakios_gl_function_refused");

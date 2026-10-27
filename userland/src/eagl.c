@@ -123,6 +123,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_DRAW_FRAMEBUFFER_BINDING     0x8ca6
 #define GL_COLOR_BUFFER_BIT             0x4000
 #define GL_NEAREST                      0x2600
+#define GL_LINEAR                       0x2601
 #define GL_LINES                        0x0001
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8cd0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8cd1
@@ -1023,16 +1024,31 @@ frame_begin(struct eagl *e)
  * library has been waited for already.
  */
 static void frame_functions(struct eagl *e);
+static void scan_frame(IOSurfaceRef surface, int width, int height, bool in_place);
 static void
 frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	/*
+	 * The display's picture, if this frame drew into it: noted here, in the first loop, because target_to_surface() clears `drawn`
+	 * (every display frame on the phone is of the mirror kind, copied into the surface by the GPU just below), so the second
+	 * loop and the debug lines after it never saw `drawn` set (25 October, run 221026).
+	 */
+	IOSurfaceRef scan_surface = NULL;
+	int scan_width = 0, scan_height = 0;
+	bool scan_in_place = false;
 
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].width >= 1000 && e->images[i].height >= 2000) {
+			scan_surface = e->images[i].surface;
+			scan_width = e->images[i].width;
+			scan_height = e->images[i].height;
+			scan_in_place = e->images[i].shared || e->images[i].mirror != 0;
+		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
 			in_place++;
@@ -1063,12 +1079,21 @@ frame_end(struct eagl *e, bool finished)
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
+			if (e->images[i].width >= 1000 && e->images[i].height >= 2000 && scan_surface == NULL) {
+				scan_surface = e->images[i].surface;    /* (the display's picture, drawn into this frame) */
+				scan_width = e->images[i].width;
+				scan_height = e->images[i].height;
+				scan_in_place = e->images[i].shared;
+			}
 			copied += !e->images[i].shared;
 			target_to_surface(e, &e->images[i]);
 			if (shown_texture != 0) {
 				show_texture(e, &e->images[i]);
 			}
 		}
+	}
+	if (scan_surface != NULL) {
+		scan_frame(scan_surface, scan_width, scan_height, scan_in_place);
 	}
 	if (!e->in_frame) {
 		return;
@@ -1814,6 +1839,339 @@ number_text(const float *values, size_t from, size_t count)
 static void *ca_context;                /* CoreAnimation's GLContext */
 static GLfloat function_values[90][20];
 static uint8_t function_given[90];
+
+/* ---- the final scale on the GPU (boot-arg apollo_gpu_present=1, the Mi 10T) ------------------------------------ */
+
+/*
+ * CoreAnimation's frame is 1125 x 2436 (the iPhone X's display, which iOS believes this phone has); the panel is 1080 x 2400.
+ * The display's driver scaled one into the other with the processor (iokit/Kernel/MiniIOMobileFramebuffer.cpp, drawLayer()).
+ * Here the GPU does it: inject.c calls hakios_gl_scan() with every SwapEnd's request (the 0x46c bytes
+ * IOMobileFramebufferSwapEnd sends the kernel, which MiniIOMobileFramebuffer.cpp lists the words of: SWAP_ID, SWAP_SURFACE(),
+ * SWAP_SOURCE(), SWAP_DEST()), before it goes on to the kernel. For a swap of one full-display BGRA layer this
+ *
+ *   1. asks ApolloGPU (kApolloScanout, devices/mi-10t/xnu: hakios.apollo_gpu.cpp) for a free one of the panel's three frames,
+ *   2. draws the layer's surface into it, scaled, with glBlitFramebuffer(GL_LINEAR) -- Mesa's freedreno does a scaled blit with
+ *      its 3D blitter -- in a context of its own: CoreAnimation's keeps every binding it believes it has,
+ *   3. sends the work to the kernel without waiting for it (a fence asked to flush, as frame_end() does), and
+ *   4. tells the kernel that this swap's frame is in that panel frame (kScanoutQueue), so that the display's driver waits for the
+ *      GPU's last submission that named the panel frame, and flips to it without copying anything.
+ * The surface and the frame are both textures made of memory by the same road, glEGLImageTargetTexture2DOES with the surface's
+ * ID (hakios_gl_surface_texture); the panel's frames have IDs of their own (kScanoutSurface + index), which only ApolloGPU
+ * knows. Anything else about a swap -- another layer, an overlay, a surface that is not BGRA, no free frame in 50 ms, any
+ * request of the kernel that fails -- leaves it as it was: the processor draws it.
+ */
+#define SCAN_SELECTOR           0x7c            /* ApolloGPU's kApolloScanout */
+#define SCAN_SURFACE            0x5ca00000u     /* its kScanoutSurface */
+#define SCAN_INFO               0
+#define SCAN_ACQUIRE            1
+#define SCAN_QUEUE              2
+#define SCAN_RELEASE            3
+#define SCAN_SWAP_SIZE          0x46c
+#define SCAN_SOURCES            6               /* surfaces kept as textures */
+
+struct scan_request {
+	uint32_t op, index, surface, swap;
+	uint32_t timeout_ms, count, width, height;
+	uint32_t stride, display_width, display_height, pad;
+};
+
+static struct {
+	int state;                      /* 0: not tried, 1: ready, -1: not available (and it stays so) */
+	io_connect_t connection;
+	struct hakios_gl *gl;          /* the context these calls are made in */
+	struct scan_request info;
+	GLuint frame_texture[3], frame_buffer[3], reader;
+	struct scan_source {
+		uint32_t id;
+		IOSurfaceRef surface;   /* held while it is here: its ID is not given to another */
+		GLuint texture;         /* 0: it cannot be one (not BGRA, not one plane, not shareable) */
+		GLsizei width, height;
+		uint64_t used;
+	} sources[SCAN_SOURCES];
+	uint64_t frames, taken, refused, reported;
+	int by_frame, swap_hook;
+} scan;
+
+static int
+scan_call(struct scan_request *request)
+{
+	size_t size = sizeof(*request);
+
+	return IOConnectCallStructMethod(scan.connection, SCAN_SELECTOR, request, sizeof(*request), request, &size);
+}
+
+static bool
+scan_setup(void)
+{
+	io_service_t service;
+	struct hakios_gl *previous = current ? current->gl : NULL;
+	bool ok = false;
+
+	scan.state = -1;
+	if ((service = IOServiceGetMatchingService(0, IOServiceMatching("ApolloGPU"))) == 0) {
+		return false;
+	}
+	if (IOServiceOpen(service, mach_task_self(), 0, &scan.connection) != 0) {
+		IOObjectRelease(service);
+		return false;
+	}
+	IOObjectRelease(service);
+	scan.info.op = SCAN_INFO;
+	if (scan_call(&scan.info) != 0 || scan.info.count != 3 || scan.info.width == 0 || scan.info.height == 0) {
+		say("hakios-gl: apollo_gpu_present: the kernel has no panel frames to draw into (apollo_flip=1 and "
+		    "apollo_gpu_present=1 are both wanted)\n");
+		return false;
+	}
+	if ((scan.gl = hakios_gl_create(3)) == NULL || !hakios_gl_make_current(scan.gl)) {
+		say("hakios-gl: apollo_gpu_present: no context of our own\n");
+		return false;
+	}
+	glGenFramebuffers(1, &scan.reader);
+	ok = true;
+	for (unsigned i = 0; i < 3 && ok; i++) {
+		glGenTextures(1, &scan.frame_texture[i]);
+		glBindTexture(GL_TEXTURE_2D, scan.frame_texture[i]);
+		ok = hakios_gl_surface_texture(scan.gl, SCAN_SURFACE + i) != 0;
+		glGenFramebuffers(1, &scan.frame_buffer[i]);
+		glBindFramebuffer(GL_FRAMEBUFFER, scan.frame_buffer[i]);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scan.frame_texture[i], 0);
+		ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+		if (!ok) {
+			say("hakios-gl: apollo_gpu_present: panel frame %u is not a render target for %s (GL error %#x)\n", i,
+			    hakios_gl_library(), glGetError());
+		}
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	hakios_gl_make_current(previous);
+	if (ok) {
+		scan.state = 1;
+		say("hakios-gl: apollo_gpu_present: the panel's frames (%ux%u, rows of %u bytes) are render targets; the display is %ux%u\n",
+		    scan.info.width, scan.info.height, scan.info.stride, scan.info.display_width, scan.info.display_height);
+	}
+	return ok;
+}
+
+/* The texture of a surface to scale from (the one the GL context in use has, bound to nothing); 0: not one. With scan.gl current. */
+static struct scan_source *
+scan_source(uint32_t id)
+{
+	struct scan_source *use = NULL;
+	GLint bound = 0;
+
+	for (unsigned i = 0; i < SCAN_SOURCES; i++) {
+		if (scan.sources[i].id == id && scan.sources[i].surface != NULL) {
+			scan.sources[i].used = scan.frames;
+			return &scan.sources[i];
+		}
+		if (use == NULL || scan.sources[i].surface == NULL || (use->surface != NULL && scan.sources[i].used < use->used)) {
+			use = &scan.sources[i];
+		}
+	}
+	if (use->surface != NULL) {
+		if (use->texture != 0) {
+			glDeleteTextures(1, &use->texture);
+		}
+		CFRelease(use->surface);
+	}
+	bzero(use, sizeof(*use));
+	if ((use->surface = IOSurfaceLookup(id)) == NULL) {
+		return NULL;
+	}
+	use->id = id;
+	use->used = scan.frames;
+	use->width = (GLsizei)IOSurfaceGetWidth(use->surface);
+	use->height = (GLsizei)IOSurfaceGetHeight(use->surface);
+	if (IOSurfaceGetPixelFormat(use->surface) != 0x42475241 /* 'BGRA' */ || IOSurfaceGetPlaneCount(use->surface) != 0 ||
+	    IOSurfaceGetBytesPerElement(use->surface) != 4) {
+		return use;
+	}
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glGenTextures(1, &use->texture);
+	glBindTexture(GL_TEXTURE_2D, use->texture);
+	if (!hakios_gl_surface_texture(scan.gl, id)) {
+		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+		glDeleteTextures(1, &use->texture);
+		use->texture = 0;
+		return use;
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	return use;
+}
+
+#define SCAN_BY_SURFACE         0x80000000u     /* in kScanoutQueue's swap word: the rest is the layer 0 surface's ID, not a swap number */
+
+/*
+ * Scale `surface` (the part `source`, x y w h, or all of it if that is NULL) into a free panel frame and tell the kernel: by the number
+ * of the swap (`mark` = the number) or, with SCAN_BY_SURFACE, by the surface's ID (the kernel's present() takes it for the next swap
+ * whose layer 0 is that surface). 1: done; 0: nothing was done.
+ */
+static int
+scan_present(uint32_t surface, const int32_t *source, uint32_t mark, uint64_t began)
+{
+	int32_t sx = 0, sy = 0, sw = 0, sh = 0;
+	struct scan_request ask;
+	struct scan_source *from;
+	struct hakios_gl *previous;
+	GLsync sync;
+	uint64_t flushed;
+
+	previous = current ? current->gl : NULL;
+	if (previous != NULL) {
+		glFlush();                      /* (what CoreAnimation has not yet sent: it goes to the GPU before ours) */
+	}
+	if (!hakios_gl_make_current(scan.gl)) {
+		hakios_gl_make_current(previous);
+		return 0;
+	}
+	if ((from = scan_source(surface)) == NULL || from->texture == 0) {
+		scan.refused++;
+		hakios_gl_make_current(previous);
+		return 0;
+	}
+	if (source != NULL) {
+		sx = source[0];
+		sy = source[1];
+		sw = source[2];
+		sh = source[3];
+	}
+	if (sw <= 0 || sh <= 0) {
+		sx = sy = 0;
+		sw = from->width;
+		sh = from->height;
+	}
+	if (sx < 0 || sy < 0 || sx + sw > from->width || sy + sh > from->height) {
+		hakios_gl_make_current(previous);
+		return 0;
+	}
+	memset(&ask, 0, sizeof(ask));
+	ask.op = SCAN_ACQUIRE;
+	ask.timeout_ms = 50;
+	if (scan_call(&ask) != 0 || ask.index > 2) {
+		scan.refused++;
+		hakios_gl_make_current(previous);
+		return 0;
+	}
+	/* (the whole panel frame is written, so what was in it does not matter) */
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, scan.reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, from->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scan.frame_buffer[ask.index]);
+	glBlitFramebuffer(sx, sy, sx + sw, sy + sh, 0, 0, (GLint)scan.info.width, (GLint)scan.info.height, GL_COLOR_BUFFER_BIT,
+	    GL_LINEAR);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	/* the GPU is not waited for; Mesa may hold the work back after a glFlush, so a fence is asked to send it (see frame_end()) */
+	sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	if (sync != NULL) {
+		(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+		glDeleteSync(sync);
+	}
+	flushed = now_us();
+	hakios_gl_make_current(previous);
+	ask.op = SCAN_QUEUE;
+	ask.swap = mark;
+	if (scan_call(&ask) != 0) {
+		ask.op = SCAN_RELEASE;
+		scan_call(&ask);
+		scan.refused++;
+		return 0;
+	}
+	scan.frames++;
+	if (scan.frames <= 3 || scan.frames % 600 == 0) {
+		say("hakios-gl: apollo_gpu_present: %s %u: surface %u (%dx%d) scaled into panel frame %u by the GPU: %llu us to "
+		    "send, %llu us in all (frame %llu, %llu left to the processor)\n", (mark & SCAN_BY_SURFACE) ? "frame of surface" : "swap",
+		    mark & ~SCAN_BY_SURFACE, surface, from->width, from->height, ask.index, flushed - began, now_us() - began,
+		    scan.frames, scan.refused);
+	}
+	return 1;
+}
+
+/*
+ * From inject.c, with the request of every SwapEnd, before the kernel has it (only where dyld's interposing reaches the call, which
+ * it does not for the cache's own images: hakios_gl_scan_frame() is the road that always works, and once it has been used this
+ * one stands aside). 1: the frame is scaled into a panel frame by the GPU, and the kernel has been told (it takes the swap from
+ * there); 0: nothing was done, the kernel draws the swap itself.
+ */
+int
+hakios_gl_scan(const void *request)
+{
+	const uint8_t *swap = request;
+	const int32_t *source = (const int32_t *)(swap + 0x64), *dest = (const int32_t *)(swap + 0xc4);
+	uint32_t id, surface;
+	uint64_t began = now_us();
+
+	if (scan.state < 0 || scan.by_frame) {
+		return 0;
+	}
+	if (scan.swap_hook++ == 0) {
+		say("hakios-gl: apollo_gpu_present: the SwapEnd hook (inject.c's interposing) is called\n");
+	}
+	if (scan.state == 0 && !scan_setup()) {
+		return 0;
+	}
+	memcpy(&id, swap + 0x50, 4);
+	for (unsigned layer = 1; layer < 4; layer++) {
+		memcpy(&surface, swap + 0x54 + 4 * layer, 4);
+		if (surface != 0) {
+			return 0;               /* (more than the bottom layer) */
+		}
+	}
+	memcpy(&surface, swap + 0x54, 4);
+	if (surface == 0 || (dest[2] > 0 && dest[3] > 0 && (dest[0] != 0 || dest[1] != 0 ||
+	    (uint32_t)dest[2] != scan.info.display_width || (uint32_t)dest[3] != scan.info.display_height))) {
+		return 0;                       /* (not the whole display) */
+	}
+	return scan_present(surface, source, id, began);
+}
+
+static int scan_wanted = -1;            /* boot-arg apollo_gpu_present=1 (read once) */
+
+/*
+ * From frame_end(), when a frame of CoreAnimation's has been drawn into `image`, a picture the size of the display (or near it): the
+ * road that does not depend on seeing the SwapEnd. CoreAnimation hands that surface to the display next (IOMobileFramebufferSwapSetLayer
+ * and SwapEnd, inside the cache, where nothing can be interposed); the GPU scales it now, and the kernel is told it by the surface's ID,
+ * so that the swap whose layer 0 is that surface is shown from the panel frame (kScanoutQueue with SCAN_BY_SURFACE). The picture
+ * has to be drawn in place (the surface's own memory), else the surface is not up to date for the GPU yet: the processor's road then.
+ */
+static void
+scan_frame(IOSurfaceRef surface, int width, int height, bool in_place)
+{
+	static uint64_t seen, scaled, cpu_before;
+	uint64_t began = now_us();
+	bool done = false;
+
+	if (scan_wanted < 0) {
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		scan_wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "apollo_gpu_present=1") != NULL;
+	}
+	if (!scan_wanted || scan.state < 0 || (scan.state == 0 && !scan_setup())) {
+		return;
+	}
+	if (seen++ == 0) {
+		say("hakios-gl: apollo_gpu_present: the first frame drawn into the display's picture (surface %u, %dx%d%s) is seen here; "
+		    "frames are scaled from here on\n", IOSurfaceGetID(surface), width, height, in_place ? "" : ", not in place");
+	}
+	/*
+	 * (Not only a picture drawn in place: one drawn into a texture of ours has just been copied into the surface by the GPU,
+	 * target_to_surface() above, on the same ring -- every display frame was of that kind on the phone, 25 October.)
+	 */
+	if ((uint32_t)width == scan.info.display_width && (uint32_t)height == scan.info.display_height &&
+	    scan_present(IOSurfaceGetID(surface), NULL, SCAN_BY_SURFACE | IOSurfaceGetID(surface), began)) {
+		scan.by_frame = 1;
+		scaled++;
+		done = true;
+	}
+	if (!done) {
+		cpu_before++;
+	}
+	if (seen % 100 == 0) {
+		say("hakios-gl: apollo_gpu_present: %llu frames in all: %llu scaled by the GPU, %llu left to the processor (last 100: %llu)\n",
+		    seen, scaled, cpu_before, 100 - (scaled - scan.reported));
+		scan.reported = scaled;
+	}
+}
 
 /* From inject.c, at every GLContext::function_uniform(): the numbers a function is given, which no shader of CoreAnimation's takes. */
 void

@@ -36,7 +36,11 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	if (connection_fd >= 0) {
 		return dup(connection_fd);
 	}
-	service = IOServiceGetMatchingService(0, IOServiceMatching(HAKIOS_GPU_SERVICE));
+	/* the Mi 10T's GPU is the service ApolloGPU (devices/mi-10t/xnu: hakios.apollo_gpu.cpp): the same interface */
+	service = IOServiceGetMatchingService(0, IOServiceMatching("ApolloGPU"));
+	if (service == 0) {
+		service = IOServiceGetMatchingService(0, IOServiceMatching(HAKIOS_GPU_SERVICE));
+	}
 	if (service == 0) {
 		return -1;
 	}
