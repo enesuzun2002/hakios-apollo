@@ -11,10 +11,11 @@ Nothing is flashed. The loader goes into RAM through `fastboot boot`, the system
 the length of a session, and a reboot brings the phone back to its own Android. This is a research
 bench, not a ROM.
 
-The first phone is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). The kernel knows nothing
-about it in advance: every address, interrupt, power rail and firmware comes from the phone's own
-device tree and its own Android, so a port to another Qualcomm phone is a new directory under
-`devices/`, not a rewrite.
+The first phone is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). The second is the **Xiaomi
+Mi 10T** (`apollo`, Snapdragon 865), a port in progress. The kernel knows nothing about either in
+advance: every address, interrupt, power rail and firmware comes from the phone's own device tree
+and its own Android, so a port to another Qualcomm phone is a new directory under `devices/`, not a
+rewrite.
 
 ## What is in the repository
 
@@ -25,7 +26,9 @@ Only my code and my data:
 - the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
   build and run scripts;
 - `prebuilt/`: the kernel, loader and libraries built from this repository;
-- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
+- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script);
+- `devices/mi-10t/`: the same for the Mi 10T, plus its own drivers as a kernel overlay
+  (`devices/mi-10t/xnu/`).
 
 Not in the repository, never:
 
@@ -38,6 +41,8 @@ Not in the repository, never:
   Apple's services. Signing in to an Apple account is impossible here and not a goal.
 
 ## Status
+
+On the POCO X5 Pro:
 
 | Works | Not yet |
 |---|---|
@@ -52,6 +57,13 @@ Not in the repository, never:
 | Cameras in Camera.app (`cam=5`) | |
 | `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
 | Sileo, Procursus packages, SSH into the phone | |
+
+On the Mi 10T, the port is newer. It has its own drivers for the touch screen, buttons, battery and
+charger, CPU clocks, display and backlight, Adreno 650 GPU, audio DSP with the CS35L41 speaker
+amplifiers, AW8697 vibration motor, and QCA6390 Wi-Fi over PCIe. Each one is off unless its own
+`apollo_*` boot-arg is given. Their state, and what is still provisional, are in
+[`devices/mi-10t/README.md`](devices/mi-10t/README.md). The modem, the cameras and the microphone
+are not ported to this phone.
 
 ## Quick start in QEMU
 
@@ -71,8 +83,9 @@ The lock screen appears after two or three minutes. The mouse with the button he
 
 ## On the phone
 
-A phone with a port (`devices/poco-x5-pro/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
-`fastboot` on the PC, the images from the previous section, and the phone's own firmware:
+A phone with a port (`devices/poco-x5-pro/` for the POCO X5 Pro 5G, `devices/mi-10t/` for the Mi
+10T), its boot loader unlocked, `adb` and `fastboot` on the PC, the images from the previous section,
+and the phone's own firmware. On the POCO:
 
 ```sh
 devices/poco-x5-pro/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
@@ -86,7 +99,20 @@ XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 
 
 `tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
 
-The main kernel arguments (the full list is in `docs/ru/notes.md`):
+On the Mi 10T, the steps are its own, and its images are built with `DEVICE=mi-10t` so that only its
+firmware goes in:
+
+```sh
+devices/mi-10t/pull-firmware.sh                 # the Mi 10T's firmware over adb -> fw-*-apollo/
+devices/mi-10t/tools/mk-ath11k.sh               # its Wi-Fi driver object, linked by make kernel
+make kernel loader
+DEVICE=mi-10t RC_JOBS=../devices/mi-10t/userland/rc.jobs GL=1 make images
+devices/mi-10t/run.sh 900                       # a 15-minute session with every Mi 10T driver on
+```
+
+Its boot-args (`apollo_touch=1`, `apollo_gpu=N`, `apollo_wifi=N` and the rest) are listed in its README.
+
+The POCO's main kernel arguments (the full list is in `docs/ru/notes.md`):
 
 | Argument | What it does |
 |---|---|
@@ -130,7 +156,8 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 | `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
 | `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
 | `devices/poco-x5-pro/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
-| `tools/` | APFS, firmware, QMI tests, run scripts |
+| `devices/mi-10t/` | the Mi 10T: its UEFI port, prebuilt UEFI images, kernel overlay (`xnu/`: `hakios.apollo_*` drivers and `mi-10t.patch`), loader platform, Wi-Fi build, firmware and run scripts |
+| `tools/` | APFS, firmware, QMI tests, run scripts; `tools/ios26/`: scripts for an iOS 26.6.2 system image (used with the loader's `identity=iphone12,3`) |
 | `qemu/` | running in QEMU |
 | `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`, `metal.md`: the GPU |
 | `prebuilt/` | the built kernel, loader and libraries |
@@ -141,8 +168,12 @@ The kernel, loader and user space are shared. Everything about one phone lives i
 `devices/<name>/`: its UEFI, device tree, firmware list and tools. `devices/poco-x5-pro/` is the
 first, and its README is the map of what a port to another Qualcomm phone must bring.
 The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
-numbers came from. `devices/mi-10t/` is the Xiaomi Mi 10T (SM8250), whose drivers and hooks are its
-own kernel overlay (`devices/mi-10t/xnu/`, applied by `xnu/apply.sh`); its README says how to run it.
+numbers came from. `devices/mi-10t/` is the Xiaomi Mi 10T (SM8250). Its drivers
+(`hakios.apollo_*.c`, `hakios.apollo_gpu.cpp`) and its hooks into the shared kernel
+(`mi-10t.patch`) are its own kernel overlay in `devices/mi-10t/xnu/`. `xnu/apply.sh` lays it over
+the common work, and `xnu/export.sh` saves it back there. They start only when the loader has
+recognised the phone (`device=apollo`), and the POCO's drivers stay off on it. Its README says how
+to build and run it.
 
 ## Cellular
 
