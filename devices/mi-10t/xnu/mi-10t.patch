@@ -1,0 +1,603 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index be702e28890d..26ee71fa15db 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,15 @@ bsd/dev/hakios.cpufreq.c	standard
+ bsd/dev/hakios.adreno.c	standard
+ bsd/dev/hakios.audio.c		standard
+ bsd/dev/hakios.virtio_sound.c	standard
++bsd/dev/hakios.apollo_input.c		standard
++bsd/dev/hakios.apollo_touch.c		standard
++bsd/dev/hakios.apollo_buttons.c		standard
++bsd/dev/hakios.apollo_battery.c		standard
++bsd/dev/hakios.apollo_cpufreq.c		standard
++bsd/dev/hakios.apollo_backlight.c	standard
++bsd/dev/hakios.apollo_display.c		standard
++bsd/dev/hakios.apollo_frames.c		standard
++bsd/dev/hakios.apollo_adreno.c		standard
+ bsd/dev/hakios.speaker.c	standard
+ bsd/dev/hakios.guard.c		standard
+ bsd/dev/hakios.haptic.c		standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 4a6e0ccfc590..1975683c3e2c 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -149,6 +149,7 @@
+ #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
+ #include <sys/hakios.input.h>
+ #include <sys/hakios.audio.h>
++#include <sys/hakios.apollo_input.h>
+ #include <sys/hakios.virtio_blk.h>
+ #include <sys/hakios.sparse.h>
+ #if APFS
+@@ -984,6 +985,7 @@ bsd_init(void)
+ 		bsd_init_kprintf("calling devfs_kernel_mount\n");
+ 		devfs_kernel_mount(mounthere);
+ 		hakios_input_init();           /* /dev/hakios-touch */
++		apollo_input_init();            /* the Mi 10T's own drivers (device=apollo; devices/mi-10t/xnu) */
+ 		hakios_audio_init();           /* /dev/hakios-audio */
+ 		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
+ 		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 407c8df3c85c..f0fced77efe6 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -21,6 +21,8 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <kern/thread_call.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+@@ -38,6 +40,25 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
+ #include "MiniIOSurface.h"
+ 
+ extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
++extern "C" void apollo_backlight_set(uint32_t fraction);        /* the Mi 10T's backlight (bsd/dev/hakios.apollo_backlight.c): nothing elsewhere */
++extern "C" void apollo_backlight_power(bool on);
++extern "C" uint32_t apollo_display_hz(void);   /* the Mi 10T's panel timing (bsd/dev/hakios.apollo_display.c): 0 elsewhere */
++extern "C" bool apollo_display_wait_scanout(uint64_t max_ns);
++/* apollo_flip=1 (bsd/dev/hakios.apollo_display.c): three frames flipped between; scanout_get gives count 0 elsewhere */
++extern "C" int apollo_scanout_get(unsigned * count, vm_offset_t va[3], uint64_t pa[3], uint32_t * stride);
++extern "C" bool apollo_scanout_flip(unsigned index, bool gpu);
++/* apollo_gpu_present=1: frames the window server's GPU scaled into the panel's frames (hakios.apollo_gpu.cpp's kScanoutQueue) */
++extern "C" int apollo_scanout_take(void);
++extern "C" void apollo_scanout_release(unsigned index);
++extern "C" int apollo_scanout_take_mark(uint32_t swap, uint32_t surface);
++bool ApolloGPUScanoutDrawn(unsigned index, uint64_t milliseconds, bool * submitted);   /* true: the GPU is done (or drew nothing: *submitted false) */
++extern "C" bool apollo_scanout_latched(void);
++extern "C" void apollo_scanout_wait(uint32_t timeout_us);
++extern "C" unsigned apollo_scanout_front(void);
++extern "C" void apollo_frames_swap(uint64_t blocked_abs);       /* apollo_frames=1 statistics (bsd/dev/hakios.apollo_frames.c) */
++extern "C" void apollo_frames_vsync(void);
++extern "C" void apollo_frames_shown(uint64_t gpu_abs, uint64_t scan_abs, uint64_t copy_abs, uint32_t on_scan);
++bool ApolloGPUSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);     /* the Mi 10T's GPU (hakios.apollo_gpu.cpp): true if none */
+ 
+ /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
+ enum {
+@@ -85,6 +106,7 @@ enum {
+ 
+ #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
+ 
++static uint32_t gDisplayWidth, gDisplayHeight;  /* the display as user space sees it (ApolloGPU's kScanoutInfo) */
+ static uint64_t gFBLogged[2];           /* selectors already reported */
+ static uint8_t  gFBCalls[128];          /* how many calls of each selector were traced */
+ 
+@@ -183,6 +205,10 @@ micros(uint64_t absolute)
+ 	return ns / 1000;
+ }
+ 
++/*
++ * The rate iOS is told and paced by. (The Mi 10T's panel runs at 120 Hz, apollo_display.c, but iOS on this phone draws
++ * at most 60 frames a second: it is told 60, and every frame is shown for two of the panel's refreshes.)
++ */
+ static inline uint32_t
+ refreshHz(void)
+ {
+@@ -226,8 +252,17 @@ class IOMobileFramebuffer : public IOService
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ 
+ public:
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+ 	IOLock *        fLock;
+ 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
++	uint8_t *       fDraw;                  /* where drawRows() draws: fBase, or in flip mode the back frame of this show() */
++	/* apollo_flip=1: three frames, the panel scans fScanFront, fScanPending (-1: none) is flipped to but not yet latched */
++	bool            fScanTried;
++	unsigned        fScanCount;
++	uint8_t *       fScanVa[3];
++	int             fScanPending;
++	unsigned        fScanFront;
++	uint32_t        fScanMissed;
+ 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
+ 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
+ 	MiniIOSurface * fDefaultSurface;
+@@ -246,6 +281,8 @@ public:
+ 	 * on from there (rc.jobs.fps: 28% of the frames over 16.7 ms with two, 33% with one).
+ 	 */
+ 	IOLock *        fSwapLock;              /* around the next five */
++	int             fSwapScan[SWAP_QUEUE];  /* ... and of each the panel frame the GPU scaled it into (apollo_gpu_present=1), or -1 */
++	uint32_t        fStatGpuScaled, fStatGpuFell;   /* frames flipped to as the GPU made them; marked ones the processor drew after all */
+ 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
+ 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
+ 	unsigned        fSwapFirst, fSwapsWaiting;
+@@ -296,7 +333,8 @@ public:
+ 	void publishModes(void);
+ 	MiniIOSurface * defaultSurface(void);
+ 	void present(const uint8_t * swap);
+-	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
++	void show(const uint8_t * swap, MiniIOSurface ** surfaces, int scan);
++	bool scaledByGPU(const uint8_t * swap, MiniIOSurface ** surfaces);
+ 	void presenter(void);
+ 	static void presenterMain(void * self, wait_result_t result);
+ 	void reportFrameTimes(void);
+@@ -418,6 +456,7 @@ IOMobileFramebuffer::start(IOService * provider)
+ 		thread_deallocate(thread);
+ 	}
+ 	fBase = (uint8_t *) vinfo.v_baseaddr;
++	fDraw = fBase;
+ 	fPanelWidth = vinfo.v_width;
+ 	fPanelHeight = vinfo.v_height;
+ 	fRowBytes = vinfo.v_rowbytes;
+@@ -439,6 +478,8 @@ IOMobileFramebuffer::start(IOService * provider)
+ 			}
+ 		}
+ 	}
++	gDisplayWidth = fWidth;
++	gDisplayHeight = fHeight;
+ 	fColumn = IONewZero(uint32_t, fPanelWidth);
+ 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
+ 	fDiff = gDiff != 0;
+@@ -481,6 +522,48 @@ IOMobileFramebuffer::start(IOService * provider)
+ 	return true;
+ }
+ 
++/*
++ * iOS sets the brightness on the framebuffer's registry entry: IOMFBBrightnessLevel, nits in 16.16 fixed point
++ * (CoreBrightness: IORegistryEntrySetCFProperty with a SInt32; it does so only once it has found a backlight service,
++ * which this kernel does not publish yet: the slider reaches the backlight through backboardd, userland/src/inject.c). Taken for the Mi 10T's backlight (bsd/dev/hakios.apollo_backlight.c); anything else is refused
++ * as before, and the first few keys that are said so (with the program that sent them).
++ */
++IOReturn
++IOMobileFramebuffer::setProperties(OSObject * properties)
++{
++	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator * keys;
++	OSObject * next;
++	IOReturn result = kIOReturnUnsupported;
++	static unsigned said;
++
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	keys = OSCollectionIterator::withCollection(dict);
++	if (keys == NULL) {
++		return kIOReturnNoMemory;
++	}
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
++		OSNumber * number = key != NULL ? OSDynamicCast(OSNumber, dict->getObject(key)) : NULL;
++
++		if (key != NULL && number != NULL && key->isEqualTo("IOMFBBrightnessLevel")) {
++			/* CoreBrightness's value is nits in 16.16 fixed point: taken as a share of 500 nits */
++			apollo_backlight_set((uint32_t) number->unsigned32BitValue() / 500);
++			result = kIOReturnSuccess;
++		} else if (said++ < 8) {
++			char who[32] = "?";
++
++			proc_selfname(who, sizeof(who));
++			IOLog("MiniIOMobileFramebuffer: %s sets \"%s\" on the display: not taken\n", who,
++			    key != NULL ? key->getCStringNoCopy() : "?");
++		}
++	}
++	keys->release();
++	return result;
++}
++
+ /* Keep a small copy of the frame that is about to be shown (the surface is the whole screen). */
+ void
+ IOMobileFramebuffer::record(MiniIOSurface * s)
+@@ -612,7 +695,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
+ 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
+ 			continue;
+ 		}
+-		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
++		to = (uint32_t *) (fDraw + (size_t) y * fRowBytes);
+ 		if (job->unscaled) {
+ 			/* not scaled at all */
+ 			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+@@ -869,6 +952,9 @@ IOMobileFramebuffer::present(const uint8_t * swap)
+ 	if (gTouchLat) {
+ 		hakios_tl("tl: s %u at %llu\n", swapWord(swap, SWAP_ID), micros(now));
+ 	}
++	/* (the window server's GPU may have scaled this frame already: hakios.apollo_gpu.cpp, kScanoutQueue, was called just before) */
++	int scan = apollo_scanout_take_mark(swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(0)));
++
+ 	IOLockLock(fSwapLock);
+ 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
+ 	fSwapTime = now;
+@@ -878,12 +964,17 @@ IOMobileFramebuffer::present(const uint8_t * swap)
+ 		    fSwapsWaiting >= swapQueue()) {
+ 			fStatLost++;                    /* (the GPU has stopped answering: the frame before is waiting for it) */
+ 			IOLockUnlock(fSwapLock);
++			if (scan >= 0) {
++				apollo_scanout_release((unsigned) scan);
++			}
+ 			return;
+ 		}
+ 	}
++	apollo_frames_swap(mach_absolute_time() - now);
+ 	unsigned slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
+ 
+ 	memcpy(fSwap[slot], swap, SWAP_SIZE);
++	fSwapScan[slot] = scan;
+ 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+ 		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+ 
+@@ -905,6 +996,7 @@ IOMobileFramebuffer::presenter(void)
+ {
+ 	static uint8_t swap[SWAP_SIZE];         /* (one thread) */
+ 	MiniIOSurface * surfaces[SWAP_LAYERS];
++	int scan;
+ 
+ 	for (;;) {
+ 		IOLockLock(fSwapLock);
+@@ -913,8 +1005,9 @@ IOMobileFramebuffer::presenter(void)
+ 		}
+ 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
+ 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
++		scan = fSwapScan[fSwapFirst];
+ 		IOLockUnlock(fSwapLock);
+-		show(swap, surfaces);
++		show(swap, surfaces, scan);
+ 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+ 			if (surfaces[layer] != NULL) {
+ 				MiniIOSurfaceDrop(surfaces[layer]);
+@@ -924,25 +1017,144 @@ IOMobileFramebuffer::presenter(void)
+ 	}
+ }
+ 
+-/* A swap's surfaces onto the panel, once the GPU is done with them. */
++/*
++ * Is the swap of a shape the window server's GPU scaled into a panel frame correctly (apollo_gpu_present=1)? One layer, the
++ * bottom one, of 32-bit pixels in one plane, over the whole display (or with no rectangle, which is that) and a rectangle of
++ * the surface that is in it. What hooks the window server's SwapEnd (userland/src/eagl.c, hakios_gl_scan()) takes the same
++ * things from the same blob before it draws, so this holds when it is told so; if it does not, the processor draws the swap
++ * as it always did, and the GPU's frame is thrown away.
++ */
++bool
++IOMobileFramebuffer::scaledByGPU(const uint8_t * swap, MiniIOSurface ** surfaces)
++{
++	const int32_t * d = (const int32_t *) (swap + SWAP_DEST(0)), * sr = (const int32_t *) (swap + SWAP_SOURCE(0));
++	MiniIOSurface * s0 = surfaces[0];
++
++	for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
++		if (swapWord(swap, SWAP_SURFACE(layer)) != 0) {
++			return false;
++		}
++	}
++	if (swapWord(swap, SWAP_SURFACE(0)) == 0 || s0 == NULL || s0->info.bytesPerElement != 4 || s0->info.planeCount != 0) {
++		return false;
++	}
++	if (d[2] > 0 && d[3] > 0 && (d[0] != 0 || d[1] != 0 || d[2] != (int32_t) fWidth || d[3] != (int32_t) fHeight)) {
++		return false;
++	}
++	/* (the whole surface: a frame marked by its surface was scaled whole, eagl.c scan_frame(), without the swap's rectangles) */
++	return sr[2] <= 0 || sr[3] <= 0 || (sr[0] == 0 && sr[1] == 0 && (uint32_t) sr[2] == s0->info.width &&
++	    (uint32_t) sr[3] == s0->info.height);
++}
++
++/* A swap's surfaces onto the panel, once the GPU is done with them. `scan`: the panel frame the GPU scaled it into, or -1. */
+ void
+-IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
++IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, int scan)
+ {
++	bool scaled = false;
+ 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
+ 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
++	uint64_t statGpu, statScan = 0, statOnScan = 0;
+ 	uint32_t layers = 0;
++	unsigned scanBack = 0;
+ 	MiniIOSurface * recorded = NULL;
+ 	bool report;
+ 
+ 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+-		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
++		if (surfaces[layer] != NULL && (!MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS) |
++		    !ApolloGPUSurfaceDrawn(surfaces[layer], SWAP_GPU_MS))) {
+ 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+ 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+ 		}
+ 	}
+-	fStatWaiting += mach_absolute_time() - began;
++	statGpu = mach_absolute_time() - began;
++	fStatWaiting += statGpu;
+ 	began = ready = mach_absolute_time();
+-	if (gOnTheBeat) {
++	if (!fScanTried) {
++		/* (apollo_flip=1; here, not in start(): the display's driver has run by now) */
++		vm_offset_t va[3] = { (vm_offset_t) fBase, 0, 0 };
++		uint64_t pa[3];
++		uint32_t stride = 0;
++
++		fScanTried = true;
++		fScanPending = -1;
++		fScanFront = 0;
++		if (apollo_scanout_get(&fScanCount, va, pa, &stride) == 3 && stride == fRowBytes) {
++			for (unsigned i = 0; i < 3; i++) {
++				fScanVa[i] = (uint8_t *) va[i];
++			}
++			IOLog("MiniIOMobileFramebuffer: page flipping between 3 frames (stride %u)\n", stride);
++		} else {
++			fScanCount = 0;
++		}
++	}
++	if (scan >= 0) {
++		/*
++		 * apollo_gpu_present=1: the window server's GPU scaled this swap's frame into panel frame `scan` (the frame is reserved
++		 * for it, so it is neither scanned nor waiting for its latch). It is flipped to once the GPU is done with it: the
++		 * wait is the frame's GPU time, as the surfaces' above. Anything else about the swap or the frame, and the processor
++		 * draws it into some other frame as always.
++		 */
++		uint64_t waitBegan = mach_absolute_time();
++		bool submitted = false;
++
++		scaled = fScanCount == 3 && scaledByGPU(swap, surfaces);
++		if (scaled && !ApolloGPUScanoutDrawn((unsigned) scan, SWAP_GPU_MS, &submitted)) {
++			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with panel frame %d after %u ms; shown as it is\n",
++			    swapWord(swap, SWAP_ID), scan, SWAP_GPU_MS);
++		}
++		if (scaled && !submitted) {
++			scaled = false;                 /* (nothing was drawn into it) */
++		}
++		if (!scaled) {
++			apollo_scanout_release((unsigned) scan);
++			fStatGpuFell++;
++			scan = -1;
++		}
++		statGpu += mach_absolute_time() - waitBegan;
++		fStatWaiting += mach_absolute_time() - waitBegan;
++		began = ready = mach_absolute_time();
++	}
++	if (fScanCount == 3) {
++		/*
++		 * Page flipping: the frame is drawn into the one that is neither scanned (the front) nor waiting for its latch
++		 * (the pending) nor the window server's GPU's (apollo_scanout_take reserves it); no wait for the scan. The wait is, below,
++		 * for the pending one's latch before the next flip.
++		 */
++		int back = -1;
++
++		if (fScanPending >= 0 && apollo_scanout_latched()) {
++			fScanFront = apollo_scanout_front();
++			fScanPending = -1;
++		}
++		if (scaled) {
++			back = scan;
++		}
++		for (unsigned waits = 0; back < 0; waits++) {
++			back = apollo_scanout_take();
++			if (back < 0 && waits >= 200) {
++				/* (the GPU's frames are not given back: this is no way to go on, and the frame is taken as the old code did) */
++				for (back = 0; back < 3 && ((unsigned) back == fScanFront || back == fScanPending); back++) {
++				}
++				IOLog("MiniIOMobileFramebuffer: no free panel frame in 200 ms: drawing into %d\n", back);
++			} else if (back < 0) {
++				delay_for_interval(1, NSEC_PER_MSEC);
++			}
++		}
++		if (!scaled) {
++			fDraw = fScanVa[back];
++		}
++		scanBack = (unsigned) back;
++	} else if (apollo_display_wait_scanout(NSEC_PER_SEC / refreshHz() + NSEC_PER_MSEC)) {
++		/*
++		 * The Mi 10T: not our own beat but the panel's: the frame is copied the moment the scan has left the
++		 * picture, and the copy, faster than the scan, never meets it: no tear.
++		 */
++		fStatOnBeat++;
++		fStatBeatWait += mach_absolute_time() - began;
++		statScan = mach_absolute_time() - began;
++		statOnScan = 1;
++		began = mach_absolute_time();
++	} else if (gOnTheBeat) {
+ 		uint64_t period, aim, next;
+ 
+ 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+@@ -963,6 +1175,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			fBeat = next;
+ 			fStatOnBeat++;
+ 			fStatBeatWait += mach_absolute_time() - began;
++			statScan = mach_absolute_time() - began;
+ 			began = mach_absolute_time();
+ 		}
+ 	}
+@@ -986,6 +1199,25 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	}
+ 	fLastFrame = began;
+ 	report = fSwapsShown < 8;
++	if (fScanCount == 3) {
++		/*
++		 * The back frame holds a frame from two or three swaps ago: every frame must cover the panel again. The bottom layer
++		 * does (the usual case, as drawLayer() would draw it); if it does not, the frame starts black.
++		 */
++		uint32_t sid0 = swapWord(swap, SWAP_SURFACE(0));
++		const int32_t * d = (const int32_t *) (swap + SWAP_DEST(0)), * sr = (const int32_t *) (swap + SWAP_SOURCE(0));
++		MiniIOSurface * s0 = surfaces[0];
++		bool full = sid0 != 0 && s0 != NULL && s0->info.bytesPerElement == 4 && s0->info.planeCount == 0 &&
++		    (d[2] <= 0 || d[3] <= 0 || (d[0] <= 0 && d[1] <= 0 && d[0] + d[2] >= (int32_t) fWidth && d[1] + d[3] >= (int32_t) fHeight)) &&
++		    (sr[2] <= 0 || sr[3] <= 0 || (sr[0] >= 0 && sr[1] >= 0 && (uint32_t) (sr[0] + sr[2]) <= s0->info.width &&
++		    (uint32_t) (sr[1] + sr[3]) <= s0->info.height));
++
++		if (!full && !scaled) {
++			for (uint32_t y = 0; y < fPanelHeight; y++) {
++				bzero(fDraw + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
++			}
++		}
++	}
+ 	if (report) {
+ 		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
+ 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
+@@ -1008,7 +1240,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			/* the bottom layer taken away: nothing is shown, the screen is black */
+ 			if (layer == 0 && (set & 1) && fGraphics) {
+ 				for (uint32_t y = 0; y < fPanelHeight; y++) {
+-					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
++					bzero(fDraw + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+ 				}
+ 			}
+ 			continue;
+@@ -1033,16 +1265,47 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 				fGraphics = true;
+ 				PE_initialize_console(NULL, kPEGraphicsMode);
+ 			}
+-			drawLayer(s, src, dst);
++			if (!scaled) {
++				drawLayer(s, src, dst);         /* (a scaled frame is in its panel frame already: the GPU did it) */
++			}
+ 			if (layer == 0) {
+ 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
+ 			}
+ 		}
+ 	}
++	if (fScanCount == 3) {
++		/* the frame is in its buffer: the one flipped before must have latched (it is then the front), then this one is flipped to */
++		uint64_t waitFrom = mach_absolute_time(), waited;
++
++		if (fScanPending >= 0) {
++			apollo_scanout_wait(100000);
++			if (apollo_scanout_latched()) {
++				fScanFront = apollo_scanout_front();
++				fScanPending = -1;
++			}
++		}
++		if (fScanPending < 0 && apollo_scanout_flip(scanBack, scaled)) {
++			fScanPending = (int) scanBack;
++			fStatGpuScaled += scaled;
++		} else {
++			apollo_scanout_release(scanBack);       /* (still reserved: it is nobody's frame now) */
++			if (fScanMissed++ < 8) {
++				IOLog("MiniIOMobileFramebuffer: the flip before has not latched in 100 ms: this frame is not shown\n");
++			}
++		}
++		waited = mach_absolute_time() - waitFrom;
++		statScan = waited;
++		statOnScan = 1;
++		shown += waited;                /* (the copy's time, for the statistics, is without it) */
++		fStatOnBeat++;
++		fStatBeatWait += waited;
++		fDraw = fBase;
++	}
+ 	drawn = mach_absolute_time();
+ 	if (recorded != NULL) {
+ 		record(recorded);
+ 	}
++	apollo_frames_shown(statGpu, statScan, drawn >= shown ? mach_absolute_time() - shown : 0, (uint32_t) statOnScan);
+ 	fSwapsShown++;
+ 	if (gTouchLat) {
+ 		hakios_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
+@@ -1089,6 +1352,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			    "freed, in %llu us each\n", fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
+ 			    fStatSurfaces[4], made, making, again, freed, freeing);
+ 		}
++		if (fStatGpuScaled != 0 || fStatGpuFell != 0) {
++			IOLog("MiniIOMobileFramebuffer: of these frames %u were scaled by the GPU into the panel's frames (no copy here), and "
++			    "%u more were marked as such and drawn by the processor after all\n", fStatGpuScaled, fStatGpuFell);
++			fStatGpuScaled = fStatGpuFell = 0;
++		}
+ 		bzero(fStatSurfaces, sizeof(fStatSurfaces));
+ 		fStatHeld = fStatLost = fStatOnBeat = 0;
+ 		fStatWaiting = fStatBeatWait = 0;
+@@ -1267,6 +1535,7 @@ IOMobileFramebufferUserClient::vsync(void)
+ 		args[4] = (uint32_t) fVSyncCount;
+ 		args[5] = fVSyncCount >> 32;
+ 		send = true;
++		apollo_frames_vsync();
+ 		armVSync();
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -1355,10 +1624,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
+ 		}
+ 		return kIOReturnSuccess;
++	case kFBMethodRequestPowerChange:               /* in: 1 the display on, 0 off: the Mi 10T's light follows it */
++		if (args->scalarInputCount > 0) {
++			apollo_backlight_power(in[0] != 0);
++		}
++		return kIOReturnSuccess;
+ 	case kFBMethodSwapSignal:
+ 	case kFBMethodSwapCancel:
+ 	case kFBMethodSwapCancelAll:
+-	case kFBMethodRequestPowerChange:
+ 	case kFBMethodChangeFrameInfo:
+ 		return kIOReturnSuccess;
+ 
+@@ -1497,6 +1770,13 @@ publishAccelerator(IOService * provider)
+  * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
+  * the top left corner of the panel as they are and cut to its size.
+  */
++extern "C" void
++MiniIOMobileFramebufferSize(uint32_t * width, uint32_t * height)
++{
++	*width = gDisplayWidth;
++	*height = gDisplayHeight;
++}
++
+ extern "C" void
+ MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes)
+ {
+diff --git a/iokit/conf/files b/iokit/conf/files
+index c07be8d9e0b0..f9a2acfde934 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -83,6 +83,7 @@ iokit/Kernel/GenericARMPE.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
+ iokit/Kernel/hakios.gpu.cpp				optional iokitcpp
++iokit/Kernel/hakios.apollo_gpu.cpp			optional iokitcpp
+ iokit/Kernel/hakios.wlan.cpp			optional iokitcpp
+ iokit/Kernel/hakios.battery.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+diff --git a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
+index 9dcd99b939e8..f6882800378c 100644
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -53,6 +53,10 @@ extern void hakios_adsp_stop(void);
+ extern void hakios_adsp_quiesce(void);
+ extern void hakios_mpss_stop(void);
+ extern void hakios_mpss_quiesce(void);
++extern void apollo_adreno_quiesce(void);      /* the Mi 10T's GPU (hakios.apollo_adreno.c) */
++extern void apollo_adreno_stop(void);
++extern void apollo_display_quiesce(void);     /* the Mi 10T's panel back on the boot framebuffer (hakios.apollo_display.c) */
++extern void apollo_backlight_stop(void);      /* the Mi 10T's light as the firmware had it (hakios.apollo_backlight.c) */
+ extern void hakios_ddr_quiesce(void);
+ extern void hakios_haptic_quiesce(void);
+ extern void hakios_torch_quiesce(void);
+@@ -376,6 +380,8 @@ loader_return(void)
+ 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
+ 	hakios_adsp_quiesce();         /* nor the audio DSP */
+ 	hakios_mpss_quiesce();         /* nor the modem */
++	apollo_display_quiesce();       /* (the Mi 10T's panel back on the boot framebuffer, if it was flipped) */
++	apollo_adreno_quiesce();        /* (the Mi 10T's GPU block, if it was started: its SMMU contexts point into memory about to be reused) */
+ 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+ 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+ 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
+@@ -444,6 +450,8 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
+ 		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
+ 		hakios_adsp_stop();            /* and the audio DSP */
+ 		hakios_mpss_stop();            /* and the modem */
++		apollo_adreno_stop();           /* (the Mi 10T's GPU, if kept for the system: given back while there is a thread to wait in) */
++		apollo_backlight_stop();        /* (and its light, as the firmware had it, if it was taken over) */
+ 	}
+ 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
+ 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
+@@ -490,6 +498,8 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
+ 		hakios_adreno_stop();
+ 		hakios_wifi_stop();
+ 		hakios_adsp_stop();
++		apollo_adreno_stop();
++		apollo_backlight_stop();
+ 		loader_return();
+ 	}
+ 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
