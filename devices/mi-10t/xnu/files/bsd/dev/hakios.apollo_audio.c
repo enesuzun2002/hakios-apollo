@@ -6,25 +6,13 @@
 /*
  * /dev/apollo-audio: the sound that iOS plays (see sys/hakios.audio.h).
  *
- * What is written goes two ways:
+ * What is written goes to a sink, a driver that plays it: on apollo the speakers, through the
+ * audio DSP (hakios.apollo_sound.c, apollo_audio=5), when it is up; else nowhere.
  *
- *   to a sink   a driver that plays it: the virtio sound device under QEMU
- *               (hakios.virtio_sound.c). On the phone there is none yet (hakios.speaker.c
- *               is where it begins).
- *
- *   into a recording, with boot-arg rec_sound=N: the first N seconds of sound are also kept
- *               in one piece of memory that is left in place when the kernel returns to the
- *               loader, which hands it to the host ("xl sound"; under QEMU, the monitor's
- *               pmemsave), where tools/sound.py makes a WAV file of it. Only what is played
- *               takes room, the silence in between does not: every write is stored with the
- *               time it was made.
- *
- *                 struct rec_header, then per write: struct rec_block, frames * 4 bytes
- *
- *               With rec_sound_fed=1 as well, the recording has instead what the speakers' guard
- *               let through (hakios.guard.c, on the phone): what reaches the amplifiers. With
- *               rec_sound_mic=1, what the main microphone hears (hakios.mic.c, mic=3), in both
- *               channels.
+ * (redwood's copy also keeps a recording, boot-arg rec_sound=N, for the loader to hand to the host.
+ * Here that is NOT there yet: nothing takes the recording's memory -- rec_base stays NULL --, so
+ * rec_sound, rec_sound_fed and rec_sound_mic do nothing, and audio_record() below returns at once.
+ * Its code is kept as redwood's is, for when it is brought over.)
  *
  * When the writer has stopped, a line in the log says how long it wrote, at what rate, how much
  * of it was not silence and how loud: the only way to "hear" a machine one cannot listen to.
@@ -73,6 +61,7 @@ extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 #define QUIET_MS        500             /* no write for this long: the writer has stopped */
 #define SILENCE         8               /* samples no larger than this are silence */
 #define REC_MAX_SECONDS 1200            /* 220 MB */
+#define MAX_BELOW       (102 * 8)       /* the most iOS's volume may be under the loudest: 102 dB, in eighths */
 
 struct rec_header {
 	char     magic[8];              /* "RWSND001" */
@@ -91,6 +80,7 @@ extern uint64_t loader_sound[3];
 
 static LCK_GRP_DECLARE(audio_lck_grp, "apollo-audio");
 static LCK_MTX_DECLARE(audio_lock, &audio_lck_grp);
+static LCK_MTX_DECLARE(audio_write_lock, &audio_lck_grp);      /* one write() at a time: write_frames is its */
 
 static apollo_audio_sink_t audio_sink;
 
@@ -248,17 +238,21 @@ audio_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unus
 	return 0;
 }
 
+/* (4 KB: not on the kernel's stack; audio_write_lock is held while it is used, as uiomove() may sleep and audio_lock is not) */
+static int16_t write_frames[CHUNK_FRAMES * HAKIOS_AUDIO_CHANNELS];
+
 static int
 audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
-	int16_t frames[CHUNK_FRAMES * HAKIOS_AUDIO_CHANNELS];
+	int16_t *frames = write_frames;
 	int error = 0;
 
+	lck_mtx_lock(&audio_write_lock);
 	while (uio_resid(uio) >= HAKIOS_AUDIO_FRAME) {
 		user_ssize_t bytes = uio_resid(uio);
 
-		if (bytes > (user_ssize_t)sizeof(frames)) {
-			bytes = sizeof(frames);
+		if (bytes > (user_ssize_t)sizeof(write_frames)) {
+			bytes = sizeof(write_frames);
 		}
 		bytes -= bytes % HAKIOS_AUDIO_FRAME;
 		error = uiomove((caddr_t)frames, (int)bytes, uio);
@@ -267,6 +261,7 @@ audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		}
 		audio_play(frames, (uint32_t)(bytes / HAKIOS_AUDIO_FRAME));
 	}
+	lck_mtx_unlock(&audio_write_lock);
 	return error;
 }
 
@@ -278,17 +273,20 @@ static int
 audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
 {
 	const struct apollo_audio_volume *volume = (const struct apollo_audio_volume *)data;
+	uint32_t below;
 
 	if (command != APOLLO_AUDIO_SET_VOLUME) {
 		return ENOTTY;
 	}
+	/* (whoever opens the device may say anything: no more than MAX_BELOW, for the sink's sums not to wrap) */
+	below = volume->below > MAX_BELOW ? MAX_BELOW : volume->below;
 	lck_mtx_lock(&audio_lock);
-	volume_below = volume->below;
+	volume_below = below;
 	volume_muted = volume->muted != 0;
 	volume_generation++;
 	lck_mtx_unlock(&audio_lock);
-	say("apollo-audio: the volume: %s%u.%03u dB under the loudest\n", volume->muted ? "muted; " : "", volume->below / 8,
-	    volume->below % 8 * 125);
+	say("apollo-audio: the volume: %s%u.%03u dB under the loudest\n", volume->muted ? "muted; " : "", below / 8,
+	    below % 8 * 125);
 	return 0;
 }
 

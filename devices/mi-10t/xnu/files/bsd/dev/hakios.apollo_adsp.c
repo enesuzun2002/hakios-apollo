@@ -60,7 +60,7 @@
  * DSP's two rails, LCX and LMX, at level 384 while it boots, given back when it says it has asked
  * for its own (see rails()).
  *
- * Addresses are from the phone's own device tree (qcom,lpass@3700000, qcom,smp2p-adsp,
+ * Addresses are from the phone's own device tree (qcom,lpass@17300000, qcom,smp2p-adsp,
  * qcom,glink/adsp, qcom,ipcc@408000, power-controller@c300000, reserved-memory), layouts from
  * Linux (see hakios.wifi.c for the files).
  */
@@ -308,7 +308,7 @@ struct smem_item {
 /*
  * The DSP's items (dt: qcom,smem of qcom,smp2p-adsp, <443 429>: the item the DSP writes first, then
  * ours -- the Wi-Fi's <617 616> are in the same order; taken the other way round, the DSP made
- * our item its own and never said "up" --, and qcom,smem-id of qcom,lpass@3700000).
+ * our item its own and never said "up" --, and qcom,smem-id of qcom,lpass@17300000).
  */
 #define ITEM_SMP2P_OURS         429
 #define ITEM_SMP2P_THEIRS       443
@@ -386,8 +386,9 @@ smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsi
 		return 0;
 	}
 	for (at = sizeof(header); at + sizeof(entry) <= header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
-			break;
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size ||
+		    entry.padding_data > entry.size) {
+			break;          /* (a padding larger than the item: not an entry; its size would wrap) */
 		}
 		if (count < max) {
 			found[count].item = entry.item;
@@ -402,7 +403,8 @@ smem_items(uint32_t partition, uint32_t cacheline, struct smem_item *found, unsi
 	}
 	step_back = ((uint32_t)sizeof(entry) + cacheline - 1) & ~(cacheline - 1);
 	for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at) {
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at ||
+		    entry.padding_data > entry.size) {
 			break;
 		}
 		if (count < max) {
@@ -433,6 +435,9 @@ smem_item(uint32_t item, uint32_t *size)
 
 		for (unsigned i = 0; i < count && i < 256; i++) {
 			if (found[i].item == item) {
+				if ((uint64_t)found[i].offset + found[i].size > SMEM_SIZE) {
+					return 0;       /* (an item said to reach past the shared memory: not trusted) */
+				}
 				*size = found[i].size;
 				return found[i].offset;
 			}
@@ -491,14 +496,14 @@ struct smp2p {
 #define SMP2P_AT_NAME(i)        (20 + 20 * (i))
 #define SMP2P_AT_VALUE(i)       (36 + 20 * (i))
 
-/* The bits of the DSP's entry "slave-kernel" (dt: the interrupts of qcom,lpass@3700000). */
+/* The bits of the DSP's entry "slave-kernel" (dt: the interrupts of qcom,lpass@17300000). */
 #define DSP_FATAL               (1u << 0)
 #define DSP_READY               (1u << 1)
 #define DSP_HANDOVER            (1u << 2)
 #define DSP_STOP_ACK            (1u << 3)
 #define DSP_SHUTDOWN_ACK        (1u << 7)
 
-/* Our entry (dt: the child "master-kernel" of qcom,smp2p-adsp; "qcom,force-stop" of qcom,lpass@3700000). */
+/* Our entry (dt: the child "master-kernel" of qcom,smp2p-adsp; "qcom,force-stop" of qcom,lpass@17300000). */
 #define OUR_ENTRY_STOP          "master-kernel"
 #define DSP_STOP                (1u << 0)
 
@@ -757,7 +762,7 @@ out:
 
 /*
  * The audio DSP's logic and memories run from LPASS's own rails, LCX and LMX (dt: vdd_cx and
- * vdd_mx of qcom,lpass@3700000 are PM7325 L5 and L4 "level" regulators, RPMh resources lcx.lvl and
+ * vdd_mx of qcom,lpass@17300000 are PM8150 L11 and L4 "level" regulators, RPMh resources lcx.lvl and
  * lmx.lvl), which the boot loader leaves at retention (16). Linux and Android ask for level 384
  * while the DSP boots, until it says it has asked for its own (bit 2, "proxy-unvote"); without it
  * the DSP rang once and left "SFR Init: wdog or kernel error suspected." in its last words.
@@ -1001,8 +1006,6 @@ root_file(const char *name, uint64_t *size)
 	return data;
 }
 
-static bool from_root;                  /* the image is in memory of ours (root_file()), to be given back once written */
-
 /* For the sound (hakios.sound.c): a file of /fw on the root, read whole into memory of ours, and given back. */
 const uint8_t *
 apollo_adsp_fw_file(const char *name, uint64_t *size)
@@ -1018,11 +1021,17 @@ apollo_adsp_fw_free(const uint8_t *data, uint64_t size)
 	kfree_data(ours, size);
 }
 
-/* A file of fw/ in the small image (ADSP=1 userland/build.sh puts fw-audio/ there), else of /fw on the root (above). */
+/*
+ * A file of fw/ in the small image (ADSP=1 userland/build.sh puts fw-audio/ there), else of /fw on the root (above).
+ * *ours says which: a file of the root is in memory of ours, of *size bytes, to be given back once written; one of the
+ * small image is the small image's own memory, never given back. (Each file says so for itself: the header may be of
+ * the one and a segment of the other.)
+ */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 static const uint8_t *
-image_file(const char *name, uint64_t *size)
+image_file(const char *name, uint64_t *size, bool *ours)
 {
+	*ours = false;
 	{
 		const uint8_t *data = hakios_image_file("fw", name, size, NULL);  /* (hakios.image.c) */
 
@@ -1034,7 +1043,7 @@ image_file(const char *name, uint64_t *size)
 		const uint8_t *data = root_file(name, size);
 
 		if (data != NULL) {
-			from_root = true;
+			*ours = true;
 			return data;
 		}
 	}
@@ -1054,36 +1063,35 @@ struct elf_segment {
 static struct {
 	const uint8_t *header;
 	uint64_t header_size;
+	bool header_ours;               /* read from the root into memory of ours (image_file()): given back, header_size bytes */
 	struct {
 		uint32_t at;
 		uint32_t file_size, memory_size;
 		const uint8_t *file;
+		bool ours;              /* as header_ours, of read bytes (what was allocated, not what the header says) */
+		uint64_t read;
 	} segment[MAX_SEGMENTS];
 	unsigned segments;
 	uint32_t size;
 } image;
 
-/* The image's files given back, if they were read into memory of ours. */
+/* The image's files given back, those that were read into memory of ours (the small image's are its own). */
 static void
 image_forget(void)
 {
-	if (!from_root) {
-		return;
-	}
-	if (image.header != NULL) {
+	if (image.header != NULL && image.header_ours) {
 		void *data = (void *)(uintptr_t)image.header;
 
 		kfree_data(data, image.header_size);
 	}
-	for (unsigned s = 0; s < image.segments; s++) {
-		if (image.segment[s].file != NULL) {
+	for (unsigned s = 0; s < image.segments && s < MAX_SEGMENTS; s++) {
+		if (image.segment[s].file != NULL && image.segment[s].ours) {
 			void *data = (void *)(uintptr_t)image.segment[s].file;
 
-			kfree_data(data, image.segment[s].file_size);
+			kfree_data(data, image.segment[s].read);
 		}
 	}
 	bzero(&image, sizeof(image));
-	from_root = false;
 }
 
 static bool
@@ -1098,7 +1106,7 @@ step_firmware(void)
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
 	image.segments = 0;
-	header = image_file("adsp.mdt", &size);
+	header = image_file("adsp.mdt", &size, &image.header_ours);
 	if (header == NULL) {
 		return false;
 	}
@@ -1145,17 +1153,20 @@ step_firmware(void)
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
+		image.segment[image.segments].ours = false;
+		image.segment[image.segments].read = 0;
 		if (segment.file_size != 0) {
 			uint64_t file_size = 0;
 
 			snprintf(name, sizeof(name), "adsp.b%02u", i);
-			image.segment[image.segments].file = image_file(name, &file_size);
+			image.segment[image.segments].file = image_file(name, &file_size, &image.segment[image.segments].ours);
 			if (image.segment[image.segments].file == NULL) {
 				goto fail;
 			}
+			image.segment[image.segments].read = file_size;
 			if (file_size != segment.file_size) {
 				printf("apollo adsp: %u: fw/%s has %llu bytes, the header says %u\n", step, name, file_size, segment.file_size);
-				image.segments++;               /* (for its file to be given back) */
+				image.segments++;               /* (for its file to be given back, of the bytes read) */
 				goto fail;
 			}
 			files += file_size;
@@ -1176,7 +1187,7 @@ step_firmware(void)
 		printf("apollo adsp: %u: the image is relocatable: linked at %#x, put at %#x\n", step, base, ADSP_MEMORY);
 	}
 	printf("apollo adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
+	    "bytes of the DSP's %#x from %#x\n", step, image.header_ours ? "from /fw on the root" : "from the small image", size, hashes,
 	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
 	return true;
 fail:
@@ -1216,6 +1227,7 @@ step_mailbox(void)
 static LCK_MTX_DECLARE(dsp_lock, &adsp_lock_group);     /* the DSP being started or stopped */
 static bool rails_asked;                /* our request for its rails stands (until it asks for its own, or is shut down) */
 static bool dsp_started;
+static bool image_taken;                /* TrustZone holds the image's header (step 4): given back (PAS shutdown) if never started */
 static bool stopped_by_its_word;
 static uint32_t our_item;
 static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
@@ -1366,6 +1378,7 @@ dsp_shutdown(const char *why)
 		return false;
 	}
 	printf("apollo adsp: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
+	image_taken = false;
 	need(&ipcc);
 	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
 	doorbells();
@@ -1417,11 +1430,14 @@ step_header(void)
 	}
 	settle();
 	result = scm("to take the audio DSP's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_ADSP, kvtophys(page), 0, &answer);
+	/* (TrustZone has copied what it keeps of the header by now, as the boot loader's PIL frees it then too: the page given back) */
+	kmem_free(kernel_map, page, PAGE_SIZE);
 	if (result != 0 || answer != 0) {
 		printf("apollo adsp: %u: TRUSTZONE DOES NOT TAKE THE HEADER: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
 	printf("apollo adsp: %u: TRUSTZONE ACCEPTS THE AUDIO DSP'S SIGNATURE FROM THIS KERNEL\n", step);
+	image_taken = true;                     /* (from here, a DSP that is not started is given back to TrustZone: steps_over()) */
 
 	announce("tell TrustZone where the image will be");
 	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, ADSP_MEMORY, image.size, &answer);
@@ -1828,7 +1844,8 @@ struct glink_channel {
 	struct {
 		uint32_t size, fill;
 		uint8_t *data;
-	} our_intents[24];                      /* what the DSP may send into; an intent's number is its place here + 1 */
+	} our_intents[32];                      /* what the DSP may send into; an intent's number is its place here + 1 (apr_audio_svc's
+	                                         * table below offers 26, and the DSP may ask for a few more) */
 	uint32_t our_intent_count;
 	struct glink_packet *first, *last;      /* received, in order */
 };
@@ -1989,7 +2006,11 @@ glink_offer(struct glink_channel *channel, uint32_t size)
 	if (i >= sizeof(channel->our_intents) / sizeof(channel->our_intents[0]) || size == 0 || size > 0x10000) {
 		return false;
 	}
-	if (channel->our_intents[i].data == NULL || channel->our_intents[i].size != size) {
+	if (channel->our_intents[i].data != NULL && channel->our_intents[i].size != size) {
+		kfree_data(channel->our_intents[i].data, channel->our_intents[i].size);  /* (a place used again, for another size) */
+		channel->our_intents[i].data = NULL;
+	}
+	if (channel->our_intents[i].data == NULL) {
 		channel->our_intents[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO);
 	}
 	if (channel->our_intents[i].data == NULL) {
@@ -2012,30 +2033,33 @@ glink_pump(void)
 	char name[33];
 
 	while (glink.up && !glink.broken) {
-		uint32_t waiting = glink_waiting(), length = sizeof(message);
+		uint32_t waiting = glink_waiting(), length;
+		uint64_t wide = sizeof(message);        /* (summed in 64 bits: the DSP's numbers must not wrap it to nothing) */
 
 		if (waiting < sizeof(message)) {
 			return;
 		}
 		glink_peek(&message, 0, sizeof(message));
 		if (message.command == GLINK_OPEN) {
-			length += message.param2;
+			wide += message.param2;
 		} else if (message.command == GLINK_INTENT) {
-			length += 8 * message.param2;
+			wide += 8ull * message.param2;
 		} else if (message.command == GLINK_DATA || message.command == GLINK_DATA_MORE) {
 			if (waiting < 16) {
 				return;
 			}
 			glink_peek(words, 8, 8);
-			length = 16 + words[0];
+			wide = 16ull + words[0];
 		}
-		length = (length + 7) & ~7u;
-		if (length > glink.theirs_size - 8) {
-			printf("apollo adsp: glink: A MESSAGE OF %u BYTES (%s %u %#x): not believed, and nothing more is read\n", length,
+		wide = (wide + 7) & ~7ull;
+		if (wide == 0 || wide > glink.theirs_size - 8 ||
+		    (message.command == GLINK_INTENT && message.param2 > sizeof(channel->their_intents) / sizeof(channel->their_intents[0]))) {
+			printf("apollo adsp: glink: A MESSAGE OF %llu BYTES (%s %u %#x): not believed, and nothing more is read\n", wide,
 			    glink_name(message.command), message.param1, message.param2);
 			glink.broken = true;
 			return;
 		}
+		length = (uint32_t)wide;
 		if (waiting < length) {
 			return;
 		}
@@ -2190,9 +2214,23 @@ glink_pump(void)
 			glink_advance(length);
 			glink_say(GLINK_CLOSE_ACK, message.param1, 0, NULL, 0);
 			if ((channel = glink_theirs(message.param1)) != NULL) {
-				printf("apollo adsp: glink: THE DSP CLOSES \"%s\"\n", channel->name);
-				channel->open = false;
+				printf("apollo adsp: glink: THE DSP CLOSES \"%s\": closed from our side too, for it to be opened again\n",
+				    channel->name);
+				/*
+				 * (as Linux's qcom_glink_rx_close(): our side closed as well, and everything of the channel forgotten, so
+				 * that the DSP's next open is answered with our open and our intents again, numbered from 1; the buffers
+				 * of our intents stay, for glink_offer() to use again)
+				 */
+				if (channel->asked) {
+					glink_say(GLINK_CLOSE, channel->ours, 0, NULL, 0);
+				}
+				channel->open = channel->asked = channel->acknowledged = false;
 				channel->theirs = 0;
+				channel->our_intent_count = 0;
+				for (unsigned i = 0; i < sizeof(channel->our_intents) / sizeof(channel->our_intents[0]); i++) {
+					channel->our_intents[i].fill = 0;
+				}
+				bzero(channel->their_intents, sizeof(channel->their_intents));
 			}
 			break;
 		case GLINK_CLOSE_ACK:
@@ -2407,7 +2445,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		printf("apollo adsp: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
 		return;
 	}
-	if (header.size == 0 || at + header.size > length) {
+	if (header.size == 0 || at > length || header.size > length - at) {    /* (not at + size: the DSP's size may wrap it) */
 		printf("apollo adsp: qrtr: a datagram of %u bytes in a message of %u: dropped\n", header.size, length);
 		return;
 	}
@@ -2466,11 +2504,14 @@ struct apr_header {
 	uint32_t token, opcode;
 };
 
+/* The last packet of the audio services: written by the link's thread, read by who waits for it, both under apr_answer_lock. */
 static struct {
 	uint32_t opcode, token, length;
 	uint32_t words[64];
-	volatile bool there;
+	bool there;
 } apr_answer;
+static LCK_SPIN_DECLARE(apr_answer_lock, &adsp_lock_group);
+static struct hakios_apr_answer apr_reply;     /* the answer apr_ask() waited for (step 11's), copied out of apr_answer */
 static uint32_t apr_in, apr_out, apr_next_token = 1;
 static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
 static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
@@ -2493,6 +2534,11 @@ apr_input(const uint8_t *data, uint32_t length)
 	header_length = ((header.field >> 4) & 0xf) * 4;
 	if (header_length < sizeof(header) || header_length > length) {
 		printf("apollo adsp: apr: a header of %u bytes in a packet of %u: dropped\n", header_length, length);
+		return;
+	}
+	if (header.size < header_length) {
+		/* (the packet's own length shorter than its header: what is after the header would be a wrapped length) */
+		printf("apollo adsp: apr: a packet that says it has %u bytes, with a header of %u: dropped\n", header.size, header_length);
 		return;
 	}
 	payload = (header.size < length ? header.size : length) - header_length;
@@ -2521,17 +2567,19 @@ apr_input(const uint8_t *data, uint32_t length)
 		    "%#x %#x\n", header.from_service, header.from_domain, header.from_port, header.to_service, header.to_domain,
 		    header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2], w[3]);
 	}
+	lck_spin_lock(&apr_answer_lock);
 	bzero(apr_answer.words, sizeof(apr_answer.words));
 	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
 	apr_answer.length = payload;
 	apr_answer.opcode = header.opcode;
 	apr_answer.token = header.token;
 	apr_answer.there = true;
+	lck_spin_unlock(&apr_answer_lock);
 }
 
 /*
  * A command to one of the DSP's services (and its answer waited for, with ms): true when it was
- * sent and, if waited for, answered; the answer is in apr_answer and, if asked for, in *answer.
+ * sent and, if waited for, answered; the answer, if asked for, in *answer.
  * The port is the service's own numbering of what the command is for (ASM: session << 8 | stream).
  */
 bool
@@ -2574,7 +2622,9 @@ apollo_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 		}
 	}
 	header->token = token;
+	lck_spin_lock(&apr_answer_lock);
 	apr_answer.there = false;
+	lck_spin_unlock(&apr_answer_lock);
 	apr_waited_for = token;
 	error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
 	if (error != 0) {
@@ -2582,6 +2632,7 @@ apollo_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 	} else {
 		apr_out++;
 		for (uint32_t waited = 0; waited < ms && !answered; waited++) {
+			lck_spin_lock(&apr_answer_lock);
 			if (apr_answer.there && apr_answer.token == token) {
 				answered = true;
 				if (answer != NULL) {
@@ -2590,6 +2641,9 @@ apollo_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 					answer->length = apr_answer.length;
 					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
 				}
+			}
+			lck_spin_unlock(&apr_answer_lock);
+			if (answered) {
 				break;
 			}
 			sleep_ms(1);
@@ -2612,11 +2666,11 @@ apollo_adsp_apr_events_second(hakios_apr_events_t handler)
 	apr_events_second = handler;
 }
 
-/* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
+/* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_reply, if it came. */
 static bool
 apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
 {
-	return apollo_adsp_apr(service, 0, 0, opcode, payload, length, ms, NULL);
+	return apollo_adsp_apr(service, 0, 0, opcode, payload, length, ms, &apr_reply);
 }
 
 /* ---- the battery manager, on the channel PMIC_RTR_ADSP_APPS ------------------------------------------ */
@@ -2630,12 +2684,14 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
  * battery's) or 0x32 (the USB port's), the battery's number (0), the property's number and a word
  * that a get does not use, and is answered with the property's number, its value and a result (0:
  * good). Only gets are sent from here: nothing is set, no limit, no current, no notice asked for.
- * With adsp=1 (battmgr=0: not) it is asked every BATTMGR_SECONDS while the DSP runs, and what it says
- * goes to bsd/dev/hakios.battery.c (hakios_battery_report()), and from there to the power source
- * that iOS reads (iokit/Kernel/hakios.battery.cpp). battmgr=2: every property once, for the log.
+ * On apollo it is asked only with boot-arg apollo_battmgr=1 (the default, 0, leaves the battery to
+ * the UEFI's charger drivers, hakios.apollo_battery.c), with apollo_audio=N once the DSP is up: then
+ * every BATTMGR_SECONDS while the DSP runs, and what it says goes to bsd/dev/hakios.battery.c
+ * (hakios_battery_report()), and from there to the power source that iOS reads
+ * (iokit/Kernel/hakios.battery.cpp). apollo_battmgr=2: every property once, for the log, first.
  * Units: capacity in hundredths of a percent, voltage in uV, current in uA (more than 0 while the
  * battery takes charge), the temperature in hundredths of a degree, charges in uAh.
- * The properties' numbers are this phone's firmware's, read with battmgr=2 and checked against what
+ * The properties' numbers are redwood's firmware's (hakios.adsp.c), read with its battmgr=2 and checked against what
  * Android shows at the same moment (dumpsys battery, /sys/class/power_supply/battery): up to 9 they
  * are those of Linux's qcom_battmgr.c (sm8350), from there on one more property comes before the
  * temperature, so the temperature is 13, not 12, and the charge counter, the cycles, the designed and
@@ -2742,10 +2798,10 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 	}
 	{
-		/* boot-arg battmgr=2: every property once, for the log (which number is which on this phone's firmware) */
+		/* boot-arg apollo_battmgr=2: every property once, for the log (which number is which on this phone's firmware) */
 		uint32_t mode = 1;
 
-		PE_parse_boot_argn("battmgr", &mode, sizeof(mode));
+		PE_parse_boot_argn("apollo_battmgr", &mode, sizeof(mode));
 		for (uint32_t p = 0; mode == 2 && p < 32; p++) {
 			uint32_t v = 0;
 			bool ok = battmgr_get(BATTMGR_BATTERY_GET, p, &v);
@@ -3087,8 +3143,8 @@ step_apr(void)
 	while (now_us() - began < wait_seconds * 1000000ull) {
 		asked++;
 		if (apr_ask(APR_SVC_ADSP_CORE, AVCS_CMD_ADSP_EVENT_GET_STATE, NULL, 0, 500) &&
-		    apr_answer.opcode == AVCS_CMDRSP_ADSP_EVENT_GET_STATE) {
-			state = apr_answer.words[0];
+		    apr_reply.opcode == AVCS_CMDRSP_ADSP_EVENT_GET_STATE) {
+			state = apr_reply.words[0];
 			if (state == 1) {
 				break;
 			}
@@ -3098,16 +3154,17 @@ step_apr(void)
 	audio_up = state == 1;
 	printf("apollo adsp: %u: %s after %llu ms and %u questions (the last answer: opcode %#x, %u bytes, %#x)\n", step, state == 1 ?
 	    "THE AUDIO SERVICES ARE UP" : "THE AUDIO SERVICES DO NOT SAY THEY ARE UP", (now_us() - began) / 1000, asked,
-	    apr_answer.opcode, apr_answer.length, apr_answer.words[0]);
+	    apr_reply.opcode, apr_reply.length, apr_reply.words[0]);
 	if (apr_ask(APR_SVC_ADSP_CORE, AVCS_GET_VERSIONS, NULL, 0, 1000)) {
 		char line[400];
 		int at = 0;
 
-		for (uint32_t i = 0; i < apr_answer.length / 4 && i < 64 && at < (int)sizeof(line) - 12; i++) {
-			at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", apr_answer.words[i]);
+		line[0] = 0;
+		for (uint32_t i = 0; i < apr_reply.length / 4 && i < 64 && at < (int)sizeof(line) - 12; i++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", apr_reply.words[i]);
 		}
-		printf("apollo adsp: %u: the services and their versions (opcode %#x, %u bytes):%s\n", step, apr_answer.opcode,
-		    apr_answer.length, line);
+		printf("apollo adsp: %u: the services and their versions (opcode %#x, %u bytes):%s\n", step, apr_reply.opcode,
+		    apr_reply.length, line);
 	} else {
 		printf("apollo adsp: %u: no answer to the question of the services' versions\n", step);
 	}
@@ -3132,6 +3189,18 @@ steps_over(uint32_t done)
 	} else if (dsp_started) {
 		dsp_shutdown("the steps are over");
 	}
+	if (!dsp_started && image_taken) {
+		/* (TrustZone took the header, step 4, and the DSP was not started after it: what it holds of the image, given back) */
+		uint64_t answer = ~0ull;
+		int32_t result = scm("to forget the audio DSP's image, never started", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0,
+		    &answer);
+
+		printf("apollo adsp: %u: TrustZone %s the image it was given (the call returns %d, its answer is %#llx)\n", step,
+		    result == 0 && answer == 0 ? "forgets" : "DOES NOT FORGET", result, answer);
+		image_taken = false;
+		image_written = false;
+	}
+	image_forget();                         /* (what was read of the root and not yet written, step 5, given back) */
 	lck_mtx_unlock(&dsp_lock);
 }
 
@@ -3209,7 +3278,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		tell("apollo adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 		apollo_sound_dsp_up();          /* (apollo_audio=2 and up: the speakers' path, hakios.apollo_sound.c) */
-		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
+		battmgr_start();                /* (how the battery is, from the DSP: only with apollo_battmgr=1 or 2) */
 	} else {
 		tell("apollo adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
