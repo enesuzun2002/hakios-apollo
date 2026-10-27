@@ -63,6 +63,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hakios.audio.h"
@@ -350,7 +351,11 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	host = the_host;
 	mach_timebase_info(&timebase);
 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / HAKIOS_AUDIO_RATE;
-	sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY);
+	/* the Mi 10T (apollo) has its own device (devices/mi-10t/xnu: hakios.apollo_audio.c, the same protocol); redwood and QEMU this one */
+	sink = open("/dev/apollo-audio", O_WRONLY);
+	if (sink < 0) {
+		sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY);
+	}
 	say("hakios: audio: the speaker is with the HAL (%s: %s)\n", HAKIOS_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
 	return 0;
 }
@@ -984,8 +989,25 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 		peak = v > peak ? v : peak;
 	}
+	/*
+	 * The Mi 10T's motor driver makes its device some seconds into the run (devices/mi-10t/xnu: hakios.apollo_haptic.c brings the chip up
+	 * first), and iOS's first taps can come before that: one that found no device is tried again every 2 seconds.
+	 */
+	if (haptic == -2) {
+		static uint64_t tried;
+		uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+		if (now - tried >= 2000000000ull) {
+			tried = now;
+			haptic = -1;
+		}
+	}
 	if (haptic == -1) {
-		haptic = open("/dev/hakios-haptic", O_WRONLY | O_NONBLOCK);
+		/* the Mi 10T's motor is /dev/apollo-haptic (devices/mi-10t/xnu: hakios.apollo_haptic.c): the same samples */
+		haptic = open("/dev/apollo-haptic", O_WRONLY | O_NONBLOCK);
+		if (haptic < 0) {
+			haptic = open("/dev/hakios-haptic", O_WRONLY | O_NONBLOCK);
+		}
 		haptic = haptic >= 0 ? haptic : -2;
 	}
 	if (haptic >= 0) {
