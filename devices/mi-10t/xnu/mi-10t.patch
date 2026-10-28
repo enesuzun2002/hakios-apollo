@@ -2,7 +2,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index be702e28890d..b0f46253d799 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -125,6 +125,24 @@ bsd/dev/hakios.cpufreq.c	standard
+@@ -125,6 +125,25 @@ bsd/dev/hakios.cpufreq.c	standard
  bsd/dev/hakios.adreno.c	standard
  bsd/dev/hakios.audio.c		standard
  bsd/dev/hakios.virtio_sound.c	standard
@@ -17,6 +17,7 @@ index be702e28890d..b0f46253d799 100644
 +bsd/dev/hakios.apollo_adreno.c		standard
 +bsd/dev/hakios.apollo_adsp.c		standard
 +bsd/dev/hakios.apollo_sound.c		standard
++bsd/dev/hakios.apollo_mic.c		standard
 +bsd/dev/hakios.apollo_cs35l41.c		standard
 +bsd/dev/hakios.apollo_audio.c		standard
 +bsd/dev/hakios.apollo_guard.c		standard

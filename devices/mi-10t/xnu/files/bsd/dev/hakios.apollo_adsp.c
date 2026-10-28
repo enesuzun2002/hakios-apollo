@@ -2131,7 +2131,15 @@ glink_pump(void)
 		case GLINK_INTENT:
 			channel = glink_theirs(message.param1);
 			for (uint32_t i = 0; channel != NULL && i < message.param2; i++) {
+				static unsigned intents_said[CHANNELS];
+
 				glink_peek(words, 8 + 8 * i, 8);
+				/* (the DSP's intents, the first 32 of each channel: what we may send it, and how big) */
+				if (intents_said[channel - glink.channel] < 32) {
+					intents_said[channel - glink.channel]++;
+					printf("apollo adsp: glink: the DSP offers an intent on \"%s\": %u bytes (id %u)\n", channel->name, words[0],
+					    words[1]);
+				}
 				for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
 					if (!channel->their_intents[n].there || channel->their_intents[n].id == words[1]) {
 						channel->their_intents[n].there = true;
@@ -2259,6 +2267,45 @@ glink_pump(void)
 	}
 }
 
+/*
+ * A message that could not be sent for want of an intent of the DSP's: what the DSP had offered on that channel,
+ * and what became of our request for one, said once per channel and size (with glink_lock held).
+ */
+static void
+glink_send_failed(struct glink_channel *channel, uint32_t length, bool asked, bool fits, int found)
+{
+	static struct {
+		uint32_t ours, length;
+	} said[16];
+	static unsigned said_count;
+	unsigned there = 0, in_use = 0, largest = 0;
+
+	for (unsigned i = 0; i < said_count; i++) {
+		if (said[i].ours == channel->ours && said[i].length == length) {
+			return;
+		}
+	}
+	if (said_count < sizeof(said) / sizeof(said[0])) {
+		said[said_count].ours = channel->ours;
+		said[said_count++].length = length;
+	}
+	printf("apollo adsp: glink: %u bytes on \"%s\" NOT SENT: %s; our request for an intent %s%s\n", length, channel->name,
+	    found >= 0 ? "the intents it fits stayed in use" : fits ? "no free intent it fits" : "no intent of the DSP's is that big",
+	    !asked ? "was not made" : !channel->request_answered ? "was NOT ANSWERED" : "was answered, ",
+	    !asked || !channel->request_answered ? "" : channel->request_granted ? "GRANTED (no fitting intent came)" : "REFUSED");
+	for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
+		if (channel->their_intents[n].there) {
+			there++;
+			in_use += channel->their_intents[n].in_use;
+			largest = channel->their_intents[n].size > largest ? channel->their_intents[n].size : largest;
+			printf("apollo adsp: glink:   the DSP's intent %u: %u bytes%s\n", channel->their_intents[n].id,
+			    channel->their_intents[n].size, channel->their_intents[n].in_use ? ", in use" : "");
+		}
+	}
+	printf("apollo adsp: glink:   %u intents of the DSP's on \"%s\", %u in use, the largest %u bytes\n", there, channel->name, in_use,
+	    largest);
+}
+
 /* One whole message to the DSP on a channel; waits up to five seconds for an intent of the DSP's that it fits. */
 static int
 glink_send(struct glink_channel *channel, const void *data, uint32_t length)
@@ -2302,6 +2349,7 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 			asked = true;
 		}
 		if (waited >= 5000 || (!fits && asked && channel->request_answered && !channel->request_granted)) {
+			glink_send_failed(channel, length, asked, fits, found);
 			lck_mtx_unlock(&glink_lock);
 			return found < 0 ? ENOBUFS : EAGAIN;
 		}
@@ -2516,7 +2564,7 @@ static uint32_t apr_in, apr_out, apr_next_token = 1;
 static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
 static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
 static hakios_apr_events_t apr_events; /* the sound's (hakios.sound.c): what nobody waits for */
-static hakios_apr_events_t apr_events_second;  /* the microphones' (hakios.mic.c) */
+static hakios_apr_events_t apr_events_second;  /* the microphone's (hakios.apollo_mic.c) */
 static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
 
 /* A packet from the DSP's audio services. From the link's thread. */
@@ -3210,6 +3258,7 @@ apollo_adsp_stop(void)
 {
 	battmgr_stop();
 	apollo_sound_dsp_down();                /* the amplifiers, the stream and the port first, while the DSP still listens */
+	apollo_mic_dsp_down();                  /* and what the microphone's path has asked for */
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started) {
 		unsigned services = 0;
@@ -3233,6 +3282,7 @@ void
 apollo_adsp_quiesce(void)
 {
 	apollo_sound_quiesce();                 /* the amplifiers off, whatever the DSP's state */
+	apollo_mic_quiesce();                   /* the codec into reset, if it was let out; the microphone's lines said again */
 	if (!dsp_started) {
 		return;
 	}
@@ -3278,6 +3328,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		tell("apollo adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 		apollo_sound_dsp_up();          /* (apollo_audio=2 and up: the speakers' path, hakios.apollo_sound.c) */
+		apollo_mic_dsp_up();            /* (apollo_mic=N: the main microphone's path, hakios.apollo_mic.c) */
 		battmgr_start();                /* (how the battery is, from the DSP: only with apollo_battmgr=1 or 2) */
 	} else {
 		tell("apollo adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
