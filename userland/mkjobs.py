@@ -226,6 +226,8 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
+# DENY_MORE="word ...": a phone's own additions, for daemons that only spin on it (devices/<name>/userland/env.sh)
+DENY += tuple(os.environ.get('DENY_MORE', '').split())
 
 args = sys.argv[1:]
 rest = '--rest' in args

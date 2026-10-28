@@ -388,6 +388,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
+	# a phone's own settings for the jobs (devices/$DEVICE/userland/env.sh: DENY_MORE, ...), when DEVICE names one that has them
+	if [ -n "$DEVICE" ] && [ -f "../devices/$DEVICE/userland/env.sh" ]; then . "../devices/$DEVICE/userland/env.sh"; fi
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
