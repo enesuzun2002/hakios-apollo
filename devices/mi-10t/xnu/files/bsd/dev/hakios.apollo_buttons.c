@@ -83,9 +83,7 @@ wr(vm_offset_t address, uint32_t value)
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
 
-/* one transfer at a time through this system's observer channels (Linux: one lock for the bus) */
-static LCK_GRP_DECLARE(apollo_spmi_grp, "apollo-spmi");
-static LCK_SPIN_DECLARE(apollo_spmi_lock, &apollo_spmi_grp);
+/* one transfer at a time on the arbiter, for all the apollo drivers that use it: apollo_spmi_bus_lock (hakios.apollo_battery.c; Linux: one lock for the bus) */
 
 struct peripheral {
 	const char *name;
@@ -109,13 +107,13 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	uint32_t status, data;
 
 	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
-	lck_spin_lock(&apollo_spmi_lock);
+	lck_spin_lock(&apollo_spmi_bus_lock);       /* (one lock for the arbiter: hakios.apollo_battery.c, hakios.apollo_backlight.c) */
 	wr(channel + OBSERVER_COMMAND, COMMAND_READ | (uint32_t)reg << 4 | (count - 1));
 	do {
 		status = rd(channel + OBSERVER_STATUS);
 	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
 	data = rd(channel + OBSERVER_DATA0);
-	lck_spin_unlock(&apollo_spmi_lock);
+	lck_spin_unlock(&apollo_spmi_bus_lock);
 
 	bus.reads++;
 	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
@@ -160,6 +158,10 @@ find_channel(struct peripheral *p, uint32_t channels)
 #define PON_TYPE                0x01
 #define PON_KPDPWR              0x01            /* gen1/gen2 power-on block: power in bit 0 ... */
 #define PON_RESIN               0x02            /* ... and volume down in bit 1 */
+#define REG_INT_LATCHED         0x18            /* the interrupts latched since they were last cleared (read only here) */
+#define REG_PULL_CTL            0x70            /* the power-on block's pull-ups: */
+#define PON_RESIN_PULL_UP       0x01            /* volume down's ... */
+#define PON_KPDPWR_PULL_UP      0x02            /* ... and power's */
 #define GPIO_TYPE               0x10
 #define GPIO_LEVEL              0x01
 #define GPIO_REG_MODE           0x40            /* [1:0] 0 input */
@@ -231,8 +233,14 @@ apollo_buttons_thread(__unused void *parameter, __unused wait_result_t result)
 			problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		}
 		if (problem == NULL && id[0] == PON_TYPE) {
-			say("apollo buttons: power-on block: type %#x subtype %#x, status %#x (power %s, volume down %s)\n", id[0],
-			    id[1], status, (status & PON_KPDPWR) ? "held" : "released", (status & PON_RESIN) ? "held" : "released");
+			uint8_t pull = 0xff;
+
+			/* (Linux qpnp-power-on: PULL_CTL at +0x70, bit 0 RESIN's pull-up, bit 1 KPDPWR's; Android sets both, qcom,pull-up) */
+			(void)spmi_read(&pon, REG_PULL_CTL, &pull, 1);
+			say("apollo buttons: power-on block: type %#x subtype %#x, status %#x (power %s, volume down %s), pull-ups %#x "
+			    "(volume down's %s, power's %s)\n", id[0], id[1], status, (status & PON_KPDPWR) ? "held" : "released",
+			    (status & PON_RESIN) ? "held" : "released", pull, (pull & PON_RESIN_PULL_UP) ? "on" : "OFF",
+			    (pull & PON_KPDPWR_PULL_UP) ? "on" : "OFF");
 			power.usable = volume_down.usable = true;
 			power.last = status & PON_KPDPWR;
 			volume_down.last = status & PON_RESIN;
@@ -272,10 +280,24 @@ apollo_buttons_thread(__unused void *parameter, __unused wait_result_t result)
 	say("apollo buttons: watching%s%s%s every %u ms\n", power.usable ? " power" : "", volume_up.usable ? " volume-up" : "",
 	    volume_down.usable ? " volume-down" : "", POLL_MS);
 
-	for (unsigned tick = 1;; tick++) {
+	for (unsigned tick = 1, seen_status = ~0u, seen_latched = ~0u, told = 0;; tick++) {
 		if (power.usable && spmi_read(&pon, REG_RT_STATUS, &status, 1) == NULL) {
+			uint8_t latched = 0;
+
 			key_look(&power, status & PON_KPDPWR);
 			key_look(&volume_down, status & PON_RESIN);
+			/*
+			 * Volume down is not seen on the phone (27 October: 6 presses of volume up, none of volume down, with RESIN's
+			 * pull-up on): every change of the whole status and of the latched interrupts is said, so that a press shows
+			 * wherever it is. At most 64 lines.
+			 */
+			(void)spmi_read(&pon, REG_INT_LATCHED, &latched, 1);
+			if ((status != seen_status || latched != seen_latched) && told < 64) {
+				say("apollo buttons: power-on block status %#x, latched %#x\n", status, latched);
+				seen_status = status;
+				seen_latched = latched;
+				told++;
+			}
 		}
 		if (volume_up.usable && spmi_read(&pin, REG_RT_STATUS, &status, 1) == NULL) {
 			key_look(&volume_up, !(status & GPIO_LEVEL));

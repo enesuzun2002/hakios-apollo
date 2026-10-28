@@ -94,11 +94,10 @@ wr(vm_offset_t address, uint32_t value)
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
 static LCK_GRP_DECLARE(apollo_backlight_grp, "apollo-backlight");
-static LCK_SPIN_DECLARE(apollo_backlight_lock, &apollo_backlight_grp);
 /*
  * The brightness's state (level, lit, wanted_fraction, what the sysctls show) and the writes that change it: iOS's
  * brightness (IOMFB's property, or the sysctl from backboardd), the display's power and the run's end come from
- * different threads, each through write_level() under this. (The spin lock above is only around one transfer.)
+ * different threads, each through write_level() under this. (apollo_spmi_bus_lock, the arbiter's, is only around one transfer.)
  */
 static LCK_MTX_DECLARE(apollo_backlight_state_lock, &apollo_backlight_grp);
 
@@ -128,13 +127,13 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	uint32_t status, data;
 
 	nanoseconds_to_absolutetime(TRANSFER_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
-	lck_spin_lock(&apollo_backlight_lock);
+	lck_spin_lock(&apollo_spmi_bus_lock);  /* (one lock for the arbiter, shared with the battery and buttons drivers) */
 	wr(channel + CHANNEL_COMMAND, OP_EXT_READL << 27 | (uint32_t)reg << 4 | (count - 1));
 	do {
 		status = rd(channel + CHANNEL_STATUS);
 	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
 	data = rd(channel + CHANNEL_RDATA0);
-	lck_spin_unlock(&apollo_backlight_lock);
+	lck_spin_unlock(&apollo_spmi_bus_lock);
 	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
 		return spmi_status_text(status);
 	}
@@ -156,13 +155,13 @@ spmi_write(const struct peripheral *p, uint8_t reg, const uint8_t *bytes, uint32
 		data |= (uint32_t)bytes[i] << (8 * i);
 	}
 	nanoseconds_to_absolutetime(TRANSFER_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
-	lck_spin_lock(&apollo_backlight_lock);
+	lck_spin_lock(&apollo_spmi_bus_lock);  /* (one lock for the arbiter, shared with the battery and buttons drivers) */
 	wr(channel + CHANNEL_WDATA0, data);
 	wr(channel + CHANNEL_COMMAND, OP_EXT_WRITEL << 27 | (uint32_t)reg << 4 | (count - 1));
 	do {
 		status = rd(channel + CHANNEL_STATUS);
 	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
-	lck_spin_unlock(&apollo_backlight_lock);
+	lck_spin_unlock(&apollo_spmi_bus_lock);
 	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
 		return spmi_status_text(status);
 	}
