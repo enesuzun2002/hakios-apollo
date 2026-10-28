@@ -1057,6 +1057,7 @@ static uint32_t mic_path = 1;           /* boot-arg apollo_mic_path=N: 1 Android
 static uint32_t mic_mix;                /* boot-arg apollo_mic_mix=N (path 1): 0 the two channels' average, 1 the main one, 2 the top one */
 static uint32_t pan_setting;            /* boot-arg apollo_mic_pan=N (path 1): the IIR's pan, in place of Xiaomi's 1 (see pp_params()) */
 static uint32_t ns_setting;             /* boot-arg apollo_mic_ns=1 (path 1): Xiaomi's noise suppressor on (see pp_params()) */
+static uint32_t drc_setting = 1;        /* boot-arg apollo_mic_drc=0 (path 1): Xiaomi's multiband DRC off (see pp_params()) */
 static unsigned channels = 1;           /* what the port, the path and the stream carry: 2 on path 1 */
 static uint8_t bank_now;
 static uint32_t adc_on = 1;             /* boot-arg apollo_mic_adc=0 (a test): the ADCs and their mic biases left off, the ports alone */
@@ -1864,6 +1865,15 @@ pp_params(void)
 			say("apollo mic: the noise suppressor (EANS): enable %u, made 1 (apollo_mic_ns=1)\n", *(uint32_t *)(blob + at + 16));
 			*(uint32_t *)(blob + at + 16) = 1;
 		}
+		/*
+		 * apollo_mic_drc=0: Xiaomi's multiband DRC (module 0x10943, its enable 0x10944 { mode, enable }) off. With the
+		 * suppressor on, the hiss came back in every pause of speech (28 October): the DRC's make-up gain lifts what is
+		 * quiet, the room's hiss with it.
+		 */
+		if (module == 0x10943 && param == 0x10944 && size >= 8 && !drc_setting) {
+			say("apollo mic: the multiband DRC: enable %u, made 0 (apollo_mic_drc=0)\n", *(uint32_t *)(blob + at + 20));
+			*(uint32_t *)(blob + at + 20) = 0;
+		}
 		at += 16 + size;
 	}
 	if (pp_out_of_band(blob, sizeof(blob), v6)) {
@@ -2541,6 +2551,7 @@ apollo_mic_dsp_up(void)
 	PE_parse_boot_argn("apollo_mic_mix", &mic_mix, sizeof(mic_mix));
 	PE_parse_boot_argn("apollo_mic_pan", &pan_setting, sizeof(pan_setting));
 	PE_parse_boot_argn("apollo_mic_ns", &ns_setting, sizeof(ns_setting));
+	PE_parse_boot_argn("apollo_mic_drc", &drc_setting, sizeof(drc_setting));
 	PE_parse_boot_argn("apollo_mic_input", &smic_input, sizeof(smic_input));
 	PE_parse_boot_argn("apollo_mic_adc", &adc_on, sizeof(adc_on));
 	PE_parse_boot_argn("apollo_mic_test", &test_bits, sizeof(test_bits));
@@ -2552,6 +2563,7 @@ apollo_mic_dsp_up(void)
 		running = false;
 		return;
 	}
+	thread_set_thread_name(thread, "apollo mic");
 	thread_deallocate(thread);
 }
 
