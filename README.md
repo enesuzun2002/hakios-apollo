@@ -60,10 +60,10 @@ On the POCO X5 Pro:
 
 On the Mi 10T, the port is newer. It has its own drivers for the touch screen, buttons, battery and
 charger, CPU clocks, display and backlight, Adreno 650 GPU, audio DSP with the CS35L41 speaker
-amplifiers, AW8697 vibration motor, and QCA6390 Wi-Fi over PCIe. Each one is off unless its own
+amplifiers and the two microphones, AW8697 vibration motor, and QCA6390 Wi-Fi over PCIe. Each one is off unless its own
 `apollo_*` boot-arg is given. Their state, and what is still provisional, are in
-[`devices/mi-10t/README.md`](devices/mi-10t/README.md). The modem, the cameras and the microphone
-are not ported to this phone.
+[`devices/mi-10t/README.md`](devices/mi-10t/README.md). The modem and the cameras are not ported to
+this phone.
 
 ## Quick start in QEMU
 

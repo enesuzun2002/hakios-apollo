@@ -63,16 +63,17 @@ Each driver is off unless its own boot-arg is given. The head of each file says 
 |---|---|---|
 | `apollo_touch=1` | `hakios.apollo_touch.c` | Novatek NT36675 touch screen (SPI) |
 | `apollo_buttons=1` | `hakios.apollo_buttons.c` | power and volume keys (PM8150 PON, GPIO6) |
-| `apollo_battery=1` | `hakios.apollo_battery.c` | the battery, from the loader's page (UEFI charger drivers); `apollo_charger=N` |
+| `apollo_battery=1` | `hakios.apollo_battery.c` | the battery, read from the PM8150B's fuel gauge over SPMI; `apollo_battery_source=loader` reads the loader's page instead (UEFI charger drivers, polled by the loader during the run); `apollo_charger=N` |
 | `apollo_charge=1` | loader | the loader takes Qualcomm's charging actions 7, 1 and 0 |
-| `apollo_cpufreq=1` | `hakios.apollo_cpufreq.c` | every cluster at top speed |
+| `apollo_cpufreq=1` | `hakios.apollo_cpufreq.c` | every cluster at top speed; `apollo_ddr=1` votes the memory bus to its top too |
 | `apollo_display=1`, `apollo_display_hz=N` | `hakios.apollo_display.c` | the DPU's timing and refresh rate |
-| `apollo_flip=1` | `hakios.apollo_display.c` | three scanout frames, page-flipped |
+| `apollo_flip=1` | `hakios.apollo_display.c` | three scanout frames, page-flipped without waiting for the last flip; `apollo_flip_latest=1` lets a newer frame replace a pending one |
 | `apollo_backlight=P` | `hakios.apollo_backlight.c` | PM8150L WLED; iOS's brightness slider drives it (`kern.apollo.backlight`) |
 | `apollo_gpu=N`, `apollo_gpu_use=1` | `hakios.apollo_adreno.c`, `hakios.apollo_gpu.cpp` | Adreno 650 steps 1 to N; the `ApolloGPU` service for Mesa |
 | `apollo_gpu_present=1` | `userland/src/eagl.c` | the GPU scales each frame into a scanout frame (needs `apollo_flip=1`) |
 | `apollo_frames=1` | `hakios.apollo_frames.c` | frame pacing statistics |
 | `apollo_audio=N` | `hakios.apollo_adsp.c`, `hakios.apollo_sound.c` | the audio DSP, and from it the speakers; `/dev/apollo-audio` |
+| `apollo_mic=N` | `hakios.apollo_mic.c` | the main microphone (WCD938x ADC1 over SoundWire, needs `apollo_audio=N`): 1 a look, 2 the codec on the bus, 3 `apollo_mic_secs` of listening, 4 `/dev/hakios-mic` for iOS; `apollo_mic_path=1` (default: both microphones and Xiaomi's ACDB processing, `apollo_mic_mix=0/1/2` average/main/top) or `0` (main microphone alone, no processing); `apollo_mic_ns=1` turns on the noise suppressor in Xiaomi's chain (off in their ordinary-recording calibration) |
 | `apollo_amps_dsp=N` | `hakios.apollo_cs35l41.c` | the CS35L41 amplifiers' protection firmware |
 | `apollo_haptic=N` | `hakios.apollo_haptic.c` | the AW8697 vibration motor; `/dev/apollo-haptic` |
 | `apollo_wifi=N` | `hakios.apollo_pcie.c`, `hakios.apollo_qrtr.c`, `hakios.apollo_lx.c` | QCA6390 over PCIe0 and MHI; `wifi_bdf_phone=1` for `bd_j3s.elf`, `wifi_station=1` to join `fw/network` |
