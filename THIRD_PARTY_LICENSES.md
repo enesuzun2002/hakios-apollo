@@ -21,6 +21,7 @@ This supersedes the summary in `NOTICE`, which stays as the short, canonical lis
 | Qualcomm/Xiaomi UEFI driver binaries | `devices/poco-x5-pro/uefi/files/Binaries/` | Qualcomm / Xiaomi (from device `xbl.img`) | vendor's — **to verify** | needed only to rebuild UEFI; removable, re-extract with UEFIReader |
 | FocalTech touch firmware header | `xnu/files/bsd/dev/hakios.focaltech_fw.h` | FocalTech (device firmware blob) | vendor's — **to verify** | candidate to move to pull-from-device |
 | Apple host headers (build only) | `xnu-deps/hostinc/mach-o/`, `.../mach/` | Apple (open-source cctools/xnu headers) | APSL 2.0 | host-side Mach-O headers for the cross build |
+| Montserrat (bitmap glyphs of the Mi 10T's boot menu) | `xnuloader/menu_font.h` (made by `xnuloader/mkmenufont.py`) | The Montserrat Project Authors (github.com/JulietaUla/Montserrat), v9.000 | SIL OFL 1.1 (`xnuloader/fonts/OFL-Montserrat.txt`) | ASCII glyphs rasterised at four sizes; no Reserved Font Name |
 | Pre-built kernel & user space | `prebuilt/` | built from this repo | APSL 2.0 / MIT (as source) | reproducible from source here |
 
 ## Fetched at build time, never committed

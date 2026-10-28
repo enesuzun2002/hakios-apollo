@@ -18,6 +18,7 @@ typedef uint16_t char16;
 #define EFI_ERROR(s)         (((s) & EFI_ERROR_BIT) != 0)
 #define EFI_UNSUPPORTED      (EFI_ERROR_BIT | 3)
 #define EFI_BUFFER_TOO_SMALL (EFI_ERROR_BIT | 5)
+#define EFI_NOT_READY        (EFI_ERROR_BIT | 6)
 
 typedef struct {
 	uint32_t a; uint16_t b; uint16_t c; uint8_t d[8];
@@ -32,6 +33,18 @@ typedef struct efi_text_output {
 	void *reset;
 	efi_status (EFIAPI *output_string)(struct efi_text_output *self, const char16 *str);
 } efi_text_output;
+
+/* Simple Text Input: what ST->con_in points to (the boot menu of the Mi 10T reads its keys there) */
+typedef struct {
+	uint16_t scan_code;
+	char16 unicode_char;
+} efi_input_key;
+
+typedef struct efi_simple_text_input {
+	efi_status (EFIAPI *reset)(struct efi_simple_text_input *self, uint8_t extended);
+	efi_status (EFIAPI *read_key_stroke)(struct efi_simple_text_input *self, efi_input_key *key);
+	void *wait_for_key;
+} efi_simple_text_input;
 
 enum { EfiLoaderData = 2, EfiConventionalMemory = 7 };
 enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 };

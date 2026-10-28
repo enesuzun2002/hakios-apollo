@@ -20,6 +20,9 @@ In the repository:
 - the Wi-Fi driver: Linux's ath11k (BSD-3-Clause-Clear) and FreeBSD's LinuxKPI headers (BSD-2-Clause) are
   fetched by tools/mk-ath11k.sh at pinned releases and built on our layer wifi/lx (MIT); only the layer is here.
 
+- Montserrat (The Montserrat Project Authors), the glyphs of the Mi 10T's boot menu in xnuloader/menu_font.h:
+  SIL Open Font License 1.1, see xnuloader/fonts/OFL-Montserrat.txt.
+
 Fetched at build time, never committed:
 
 - the iOS 16.5 IPSW (Apple): the user space of the system image; sysimage/fetch.sh downloads it from

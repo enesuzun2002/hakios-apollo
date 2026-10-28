@@ -4114,6 +4114,9 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+/* the boot menu of the Mi 10T (apollo only: see menu_run()) */
+#include "menu.c"
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -4154,9 +4157,19 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
-	if (have_payload && pi.usb_mode && usb_start()) {
-		flush_log();
-		usb_command_loop();
+	if (have_payload && pi.usb_mode) {
+		int usb_ok = usb_start();
+
+		if (usb_ok) {
+			flush_log();
+		}
+		/* the Mi 10T, started from its recovery partition: the boot menu (menu.c), unless a host is there */
+		if (PLAT == &platform_apollo) {
+			menu_run(usb_ok);
+		}
+		if (usb_ok) {
+			usb_command_loop();
+		}
 	}
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */

@@ -42,6 +42,10 @@ __pycache__/
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
+!/xnuloader/menu.c
+!/xnuloader/menu_font.h
+!/xnuloader/mkmenufont.py
+!/xnuloader/fonts/
 
 /qemu/*
 !/qemu/*.sh
