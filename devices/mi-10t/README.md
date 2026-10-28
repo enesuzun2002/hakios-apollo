@@ -14,7 +14,7 @@ Pro's drivers stay off on this phone, and nothing here runs on the POCO.
 | The loader's description | `xnuloader/platform.h` (`platform_apollo`, included by `xnuloader/loader.c`) |
 | The kernel's drivers | `xnu/`: `files/` holds the drivers (`bsd/dev/hakios.apollo_*.c`, `iokit/Kernel/hakios.apollo_gpu.cpp`); `mi-10t.patch` adds them to the build and hooks `bsd_init`, `MiniIOMobileFramebuffer.cpp` and `loader_return.c`. `xnu/apply.sh` puts both on top of the common work, and `xnu/export.sh` saves them back here |
 | Wi-Fi driver object | `tools/mk-ath11k.sh` builds ath11k for the QCA6390 from `wifi/lx/` (PCIe bus, name prefix, QMI patches) into `xnu-deps/build/ath11k-apollo`, which `xnu-build.sh` links |
-| User space | `userland/firmware.sh` (the firmware into the small image), `userland/rc.jobs` (the job list) |
+| User space | `userland/firmware.sh` (the firmware into the small image), `userland/rc.jobs` (the job list), `userland/env.sh` (read by `userland/build.sh` with `DEVICE=mi-10t`: `DENY_MORE`, the launchd jobs left out on this phone only, e.g. Visual Voicemail's `vmd`, which spins on a core looking for CommCenter) |
 | The phone's firmware | **not in the repository**: `pull-firmware.sh` pulls it into `fw-*-apollo/` at the top |
 | Running | `run.sh` |
 
@@ -71,9 +71,10 @@ Each driver is off unless its own boot-arg is given. The head of each file says 
 | `apollo_backlight=P` | `hakios.apollo_backlight.c` | PM8150L WLED; iOS's brightness slider drives it (`kern.apollo.backlight`) |
 | `apollo_gpu=N`, `apollo_gpu_use=1` | `hakios.apollo_adreno.c`, `hakios.apollo_gpu.cpp` | Adreno 650 steps 1 to N; the `ApolloGPU` service for Mesa |
 | `apollo_gpu_present=1` | `userland/src/eagl.c` | the GPU scales each frame into a scanout frame (needs `apollo_flip=1`) |
-| `apollo_frames=1` | `hakios.apollo_frames.c` | frame pacing statistics |
+| `apollo_frames=1` | `hakios.apollo_frames.c` | frame pacing statistics every 2 s: frames presented and their intervals, the present path's waits, the flips |
+| `apollo_hitch=1` | `hakios.apollo_hitch.c`, `osfmk/arm64/hakios.apollo_hitch_cpu.c` | with `apollo_frames=1`: samples what each CPU runs every `apollo_hitch_us` (2000), and for every gap of more than `apollo_hitch_ms` (50) between iOS's frames says which processes ran on which CPU and what the GPU was doing; `apollo_hitch_rate` (10 a minute), `apollo_hitch_windows` (5: a CPU-use line every N windows, 0 none), `apollo_hitch_cpu` (0: the sampler's CPU), `apollo_hitch_threads=1` (user threads by name) |
 | `apollo_audio=N` | `hakios.apollo_adsp.c`, `hakios.apollo_sound.c` | the audio DSP, and from it the speakers; `/dev/apollo-audio` |
-| `apollo_mic=N` | `hakios.apollo_mic.c` | the main microphone (WCD938x ADC1 over SoundWire, needs `apollo_audio=N`): 1 a look, 2 the codec on the bus, 3 `apollo_mic_secs` of listening, 4 `/dev/hakios-mic` for iOS; `apollo_mic_path=1` (default: both microphones and Xiaomi's ACDB processing, `apollo_mic_mix=0/1/2` average/main/top) or `0` (main microphone alone, no processing); `apollo_mic_ns=1` turns on the noise suppressor in Xiaomi's chain (off in their ordinary-recording calibration) |
+| `apollo_mic=N` | `hakios.apollo_mic.c` | the microphones (WCD938x ADC1 and ADC4 over SoundWire, needs `apollo_audio=N`): 1 a look, 2 the codec on the bus, 3 `apollo_mic_secs` of listening, 4 `/dev/hakios-mic` for iOS; `apollo_mic_path=1` (default: both microphones and Xiaomi's ACDB processing, `apollo_mic_mix=0/1/2` average/main/top) or `0` (main microphone alone, no processing); `apollo_mic_ns=1` turns on the noise suppressor in Xiaomi's chain (off in their ordinary-recording calibration), `apollo_mic_drc=0` turns its multiband DRC off (its make-up gain brings the hiss back in pauses), `apollo_mic_pan=N` the IIR's pan (0, both channels; Xiaomi's is 1) |
 | `apollo_amps_dsp=N` | `hakios.apollo_cs35l41.c` | the CS35L41 amplifiers' protection firmware |
 | `apollo_haptic=N` | `hakios.apollo_haptic.c` | the AW8697 vibration motor; `/dev/apollo-haptic` |
 | `apollo_wifi=N` | `hakios.apollo_pcie.c`, `hakios.apollo_qrtr.c`, `hakios.apollo_lx.c` | QCA6390 over PCIe0 and MHI; `wifi_bdf_phone=1` for `bd_j3s.elf`, `wifi_station=1` to join `fw/network` |
