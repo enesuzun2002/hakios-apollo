@@ -3108,6 +3108,13 @@ apollo_gpu_in_flight(void)
 	return ahead > 0 ? (uint32_t)ahead : 0;
 }
 
+/* the speed the 3D core was last asked for (the governor's, apollo_gpu_speed's), in MHz; 0 while the GPU is not kept on */
+uint32_t
+apollo_gpu_mhz(void)
+{
+	return gpu_kept ? core_khz / 1000 : 0;
+}
+
 /* the core is to write down what time it is: at one end of submission `fence` */
 static void
 ring_time(uint32_t fence, uint32_t end)

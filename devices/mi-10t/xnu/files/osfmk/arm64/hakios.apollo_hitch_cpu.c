@@ -8,6 +8,8 @@
  *   - apollo_hitch_thread(): for a thread found that way, its task's BSD process (struct proc, whose p_comm the tracer reads)
  *     and its uthread (whose pth_name holds the name thread_set_thread_name gave a kernel thread), and whether it is one of
  *     the kernel's own (kernel_task).
+ *   - apollo_hitch_task_waiting(): the threads of a task that are runnable but on no processor (waiting for one), walked
+ *     through the task's thread list with the same fault-free reads.
  *   - apollo_hitch_peek(): a read of kernel memory that never faults (ml_nofault_copy).
  *   - apollo_hitch_timer(): a timer that runs the tracer's sampler every N us on one processor, in its timer interrupt.
  *
@@ -32,7 +34,9 @@
 #include <mach/mach_types.h>
 
 int apollo_hitch_cpu(unsigned cpu, uint64_t *tid, uintptr_t *thread);
-bool apollo_hitch_thread(uintptr_t thread, uintptr_t *proc, uintptr_t *uthread, bool *kernel);
+bool apollo_hitch_thread(uintptr_t thread, uintptr_t *proc, uintptr_t *uthread, bool *kernel, uintptr_t *task);
+int apollo_hitch_task_waiting(uintptr_t task, uintptr_t *threads, uint64_t *tids, uint64_t *since_abs, int max);
+bool apollo_hitch_thread_tid(uintptr_t thread, uint64_t *tid);
 size_t apollo_hitch_peek(uintptr_t from, void *to, size_t size);
 bool apollo_hitch_timer(unsigned cpu, uint64_t interval_ns, void (*tick)(uint64_t now));
 
@@ -85,13 +89,21 @@ apollo_hitch_cpu(unsigned cpu, uint64_t *tid, uintptr_t *thread)
 	return 1;
 }
 
+/* the id of the thread at `thread` now (the logger's check that a thread sampled earlier is still that one) */
+bool
+apollo_hitch_thread_tid(uintptr_t thread, uint64_t *tid)
+{
+	return apollo_hitch_peek((uintptr_t)&((thread_t)thread)->thread_id, tid, sizeof(*tid)) == sizeof(*tid);
+}
+
 /*
  * The process of a thread that apollo_hitch_cpu() found (thread_ro's tro_proc: NULL for a task without one) and its uthread
- * (co-allocated right after the thread: get_bsdthread_info is arithmetic, nothing is read). kernel: its task is kernel_task.
+ * (co-allocated right after the thread: get_bsdthread_info is arithmetic, nothing is read). kernel: its task is kernel_task;
+ * *task_out: the task itself (only ever handed back to apollo_hitch_task_waiting).
  * False: the thread was gone by now.
  */
 bool
-apollo_hitch_thread(uintptr_t thread, uintptr_t *proc, uintptr_t *uthread, bool *kernel)
+apollo_hitch_thread(uintptr_t thread, uintptr_t *proc, uintptr_t *uthread, bool *kernel, uintptr_t *task_out)
 {
 	thread_t th = (thread_t)thread;
 	uintptr_t tro, task;
@@ -105,7 +117,59 @@ apollo_hitch_thread(uintptr_t thread, uintptr_t *proc, uintptr_t *uthread, bool 
 	}
 	*kernel = task == (uintptr_t)kernel_task;
 	*uthread = (uintptr_t)get_bsdthread_info(th);
+	*task_out = task;
 	return true;
+}
+
+/*
+ * The threads of `task` (as apollo_hitch_thread gave it) that are runnable but on no processor: state TH_RUN without TH_WAIT
+ * (TH_RUN is "running or on a run queue"), and no processor's active_thread. Up to max of them: their addresses, ids, and
+ * last_made_runnable_time (when they were woken or preempted: how long they have waited for a processor). -1: the task's
+ * thread list could not be read. The list (task->threads, linked through thread->task_threads) is walked without the task's
+ * lock, with fault-free reads only: it may change under the walk, so the walk stops at the list's head, at a thread whose
+ * thread_ro does not name this task (a link into another list, or memory reused), or after 256 threads.
+ */
+int
+apollo_hitch_task_waiting(uintptr_t task, uintptr_t *threads, uint64_t *tids, uint64_t *since_abs, int max)
+{
+	uintptr_t head = (uintptr_t)&((task_t)task)->threads, link, active[MAX_SCHED_CPUS];
+	unsigned cpus = 0;
+	int found = 0;
+
+	for (unsigned cpu = 0; cpu < MAX_SCHED_CPUS && cpu < 16; cpu++) {
+		processor_t processor = processor_array[cpu];
+
+		active[cpus++] = processor == PROCESSOR_NULL ? 0 : (uintptr_t)os_atomic_load(&processor->active_thread, relaxed);
+	}
+	if (!peek_word(&((queue_head_t *)head)->next, &link)) {
+		return -1;
+	}
+	for (unsigned walked = 0; link != head && link != 0 && walked < 256 && found < max; walked++) {
+		thread_t th = (thread_t)(link - offsetof(struct thread, task_threads));
+		uintptr_t tro = 0, owner = 0;
+		int state = 0;
+		bool running = false;
+
+		if (!peek_word(&th->t_tro, &tro) || !peek_word(&((struct thread_ro *)tro)->tro_task, &owner) || owner != task ||
+		    apollo_hitch_peek((uintptr_t)&th->state, &state, sizeof(state)) != sizeof(state)) {
+			break;
+		}
+		if ((state & (TH_RUN | TH_WAIT | TH_TERMINATE)) == TH_RUN) {
+			for (unsigned cpu = 0; cpu < cpus; cpu++) {
+				running |= active[cpu] == (uintptr_t)th;
+			}
+			if (!running &&
+			    apollo_hitch_peek((uintptr_t)&th->thread_id, &tids[found], sizeof(tids[found])) == sizeof(tids[found]) &&
+			    apollo_hitch_peek((uintptr_t)&th->last_made_runnable_time, &since_abs[found], sizeof(since_abs[found])) ==
+			    sizeof(since_abs[found])) {
+				threads[found++] = (uintptr_t)th;
+			}
+		}
+		if (!peek_word(&th->task_threads.next, &link)) {
+			break;
+		}
+	}
+	return found;
 }
 
 /*

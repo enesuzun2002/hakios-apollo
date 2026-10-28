@@ -48,6 +48,7 @@ say(const char *format, ...)
 #define EPSS_FREQ_TABLE         0x100
 #define EPSS_TABLE_ROWS         40
 #define EPSS_PERF_STATE         0x320
+#define EPSS_DOMAIN_STATE       0x20            /* [7:0]: the speed the firmware has set now, in 19.2 MHz (Linux's reg_domain_state) */
 #define XO_KHZ                  19200
 #define ALTERNATE_KHZ           300000
 
@@ -486,6 +487,27 @@ apollo_thermal_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		delay_for_interval(1000, NSEC_PER_MSEC);
 	}
+}
+
+/*
+ * The speed core group `domain` (0: cores 0-3, 1: 4-6, 2: 7) runs at now, in MHz, for the hitch tracer (hakios.apollo_hitch.c,
+ * from a timer interrupt: one register read, no lock). As Linux's qcom_cpufreq_get_hw_freq reads EPSS: the domain state's
+ * [7:0] times 19.2 MHz, what the firmware has really set (below the row asked for when it limits the group itself); if that
+ * reads as nothing a core runs at, the row asked for (row_now). 0: not known (apollo_cpufreq is off, or no such group).
+ */
+uint32_t
+apollo_cpufreq_mhz(unsigned domain)
+{
+	uint32_t khz;
+
+	if (domain >= EPSS_DOMAINS || epss[domain] == 0) {
+		return 0;
+	}
+	khz = XO_KHZ * (*(volatile uint32_t *)(epss[domain] + EPSS_DOMAIN_STATE) & 0xff);
+	if (khz < 200000 || khz > 3500000) {
+		khz = row_khz[domain][row_now[domain]];
+	}
+	return khz / 1000;
 }
 
 void

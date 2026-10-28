@@ -46,6 +46,9 @@ void apollo_hitch_init(void);
 void apollo_hitch_swap(uint64_t last_abs, uint64_t now_abs);    /* apollo_frames_swap: two swaps of CA's */
 void apollo_hitch_window(bool begin, uint64_t window_ns);       /* apollo_frames_shown: a 2 s window begins, or has been told */
 uint32_t apollo_gpu_in_flight(void);    /* submissions given to the GPU and not done yet; no lock (hakios.apollo_adreno.c) */
+uint32_t apollo_gpu_mhz(void);          /* the 3D core's speed, as last asked for (hakios.apollo_adreno.c) */
+uint32_t apollo_cpufreq_mhz(unsigned domain);   /* a core group's speed now: 0 cores 0-3, 1 4-6, 2 7 (hakios.apollo_cpufreq.c) */
+void apollo_hitch_touch(bool down, bool moved); /* apollo_touch's every report: a finger down, one moved (for the hitch tracer) */
 /* a kernel thread's name (osfmk/kern/thread.c), which the hitch tracer shows for it instead of "kernel_task" */
 void thread_set_thread_name(struct thread *thread, const char *name);
 void apollo_backlight_init(void);       /* apollo_backlight=P: the panel's light, the PM8150L's WLED (bsd/dev/hakios.apollo_backlight.c) */

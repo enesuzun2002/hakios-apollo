@@ -557,6 +557,7 @@ static void
 apollo_nvt_report(const uint8_t *data, uint32_t blocks)
 {
 	static unsigned shown;
+	bool moved = false;
 
 	/* a finger that this report leaves out has been lifted (as in Linux's nvt_ts_work_func) */
 	for (uint32_t id = 0; id < NVT_MAX_TOUCHES; id++) {
@@ -614,6 +615,7 @@ apollo_nvt_report(const uint8_t *data, uint32_t blocks)
 			}
 		} else if (contact[id - 1].x != sx || contact[id - 1].y != sy) {
 			hakios_touch_post(HAKIOS_TOUCH_MOVE, id - 1, sx, sy);
+			moved = true;
 			contact[id - 1].x = sx;
 			contact[id - 1].y = sy;
 		}
@@ -624,6 +626,7 @@ apollo_nvt_report(const uint8_t *data, uint32_t blocks)
 			hakios_touch_post(HAKIOS_TOUCH_UP, id, contact[id].x, contact[id].y);
 		}
 	}
+	apollo_hitch_touch(apollo_any_down(), moved);   /* (apollo_hitch=1: a gap between frames counts only while a finger moves) */
 }
 
 /* ---- the chip's firmware -------------------------------------------------------------------------- */
@@ -1030,7 +1033,14 @@ apollo_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("apollo: Novatek touch screen ready; the report is read every %u us\n", poll_us);
 	}
 
-	uint64_t now, lifted, esd_quiet, status_every, status_at = mach_absolute_time(), edge_at = status_at;
+	uint64_t now, lifted, esd_quiet, status_every, status_at = mach_absolute_time(), edge_at = status_at, gap_long;
+	struct {
+		uint64_t since;                 /* the last report passed on */
+		bool down;                      /* a finger was down after it */
+		uint32_t reads, empty, failed, no_edge, edges, told;
+	} gap = { .since = status_at };
+
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &gap_long);
 	unsigned wdt_run = 0;
 	bool esd_pending = false;
 
@@ -1080,7 +1090,11 @@ apollo_touch_thread(__unused void *parameter, __unused wait_result_t result)
 				sleep_us(1000);
 				continue;
 			}
+			if (!edge) {
+				gap.no_edge++;
+			}
 			if (edge) {
+				gap.edges++;
 				wr(GPIO_INTR_STATUS(PIN_INT), 0);       /* before the read: an edge during it is the next report */
 				edge_at = now;
 				if (seen.edges++ == 0) {
@@ -1090,7 +1104,13 @@ apollo_touch_thread(__unused void *parameter, __unused wait_result_t result)
 			last_read = now;
 		}
 		seen.polls++;
+		/*
+		 * A gap between reports while a finger is down (the hitch tracer, 28 October: 409-479 ms without a report while a
+		 * finger moved, and no frame from iOS meanwhile): what the reads in it saw, said once the next report comes.
+		 */
+		gap.reads++;
 		if (!nvt_read(NVT_EVENT_BUF_ADDR, report, NVT_POINT_DATA_LEN + 1)) {
+			gap.failed++;
 			seen.bad++;
 			if (seen.bad < 8) {
 				printf("apollo: the touch report cannot be read\n");
@@ -1120,7 +1140,23 @@ apollo_touch_thread(__unused void *parameter, __unused wait_result_t result)
 				}
 				esd_pending = true;
 			} else if (report[0] != 0xff || report[1] != 0xff) {
+				uint64_t since = now - gap.since;
+
+				if (gap.down && since > gap_long && gap.told < 64) {
+					uint64_t ns;
+
+					absolutetime_to_nanoseconds(since, &ns);
+					gap.told++;
+					say("apollo touch: %llu ms without a report while a finger was down: %u reads (%u empty, %u failed, "
+					    "%u with no edge), %u edges, the interrupt line %u now\n", ns / 1000000, gap.reads, gap.empty,
+					    gap.failed, gap.no_edge, gap.edges, rd(GPIO_IO(PIN_INT)) & 1);
+				}
 				apollo_nvt_report(report, NVT_POINT_DATA_LEN / 6);
+				gap.since = now;
+				gap.down = apollo_any_down();
+				gap.reads = gap.empty = gap.failed = gap.no_edge = gap.edges = 0;
+			} else {
+				gap.empty++;
 			}
 		}
 		/* (nvt_esd_check_func) the firmware asked, and the line has been quiet for 1.5 s: load it again */
