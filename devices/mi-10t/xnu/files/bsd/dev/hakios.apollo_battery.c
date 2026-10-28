@@ -631,8 +631,8 @@ chg_tick(unsigned tick, bool fresh, bool temperature_valid, int temperature_c, i
  *   ADC_RR_BATT_TEMP 0x4288..89: the thermistor's reading, 10 bits; BATT_INFO_BATT_TEMP 0x4150..51, 11 bits, and
  *     BATT_INFO_BATT_TEMP_STS 0x4106 (bit 0 "available"). Xiaomi's gen4 driver reads neither for the temperature
  *     (it takes the gauge's memory, BATT_TEMP_WORD, through MEM_IF -- writes, which are not done here): the formats are
- *     the gauge memory's (signed, a quarter of a degree, also 10 bits) for the first, and gen3's (quarter kelvin, 11
- *     bits: fg_get_battery_temp() of qpnp-fg-gen3) for the second -- neither seen on this phone yet, see
+ *     whole degrees for the first (signed, 10 bits: seen on the phone, 0x21 = 33 C where Android said 35.5 C), and gen3's
+ *     (quarter kelvin, 11 bits: fg_get_battery_temp() of qpnp-fg-gen3) for the second, which reads 0 here; see
  *     temperature_choose() for how they are trusted.
  * And of the charger (smb5-reg.h): BATTERY_CHARGER_STATUS_1 0x1006 [2:0] its state, BATTERY_CHARGER_STATUS_7 0x100d
  * its own comparators on the battery's thermistor (JEITA: bit 5 hot, 4 cold, 3 too hot, 2 too cold, 1/0 the same,
@@ -724,7 +724,11 @@ gauge_read(struct gauge *g)
 	if (spmi_read(FG_RR_BATT_TEMP, t, 2) == NULL) {
 		g->rr_temp_ok = true;
 		g->rr_temp_raw = (uint16_t)((t[1] & 0x03) << 8 | t[0]);
-		g->rr_temp_q = g->rr_temp_raw >= 0x200 ? (int32_t)g->rr_temp_raw - 0x400 : (int32_t)g->rr_temp_raw;
+		/*
+		 * whole degrees, not quarters: it read 0x21 (33) on a phone charging indoors, where Android said 35.5 C a few
+		 * minutes later (28 October); as quarter degrees that was 8 C, and the cold-charging rule held the charger at 1 A
+		 */
+		g->rr_temp_q = 4 * (g->rr_temp_raw >= 0x200 ? (int32_t)g->rr_temp_raw - 0x400 : (int32_t)g->rr_temp_raw);
 	}
 	if (spmi_read(FG_INFO_BATT_TEMP, t, 2) == NULL) {
 		g->info_temp_ok = true;
@@ -900,7 +904,7 @@ gauge_describe(void)
 	    !g.missing_ok ? "??" : (g.rr_rt & FG_RR_BATT_MISSING) ? "MISSING" : "present",
 	    gauge_soc_valid(&g) ? "VALID" : "NOT VALID (the voltage and the current are used)");
 	believed = temperature_choose(&g, &celsius, &source);
-	say("apollo battery: temperature: RRADC 0x4288 %s%#x (%d.%02d C as quarter degrees), BATT_INFO 0x4150 %s%#x "
+	say("apollo battery: temperature: RRADC 0x4288 %s%#x (%d.%02d C as whole degrees), BATT_INFO 0x4150 %s%#x "
 	    "(%d.%02d C as quarter kelvin), TEMP_STS %#x, the charger's JEITA %#x: %s %d C, from %s\n",
 	    g.rr_temp_ok ? "" : "unread ", g.rr_temp_raw, g.rr_temp_q / 4, (g.rr_temp_q < 0 ? -g.rr_temp_q : g.rr_temp_q) % 4 * 25,
 	    g.info_temp_ok ? "" : "unread ", g.info_temp_raw, g.info_temp_q / 4,
@@ -1193,6 +1197,7 @@ apollo_battery_init(void)
 	}
 	if (kernel_thread_start(from_loader ? apollo_battery_thread : apollo_battery_pmic_thread, NULL, &thread) ==
 	    KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo battery");
 		thread_deallocate(thread);
 	}
 }
