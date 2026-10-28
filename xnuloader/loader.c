@@ -2500,10 +2500,32 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 	return x0;
 }
 
+/*
+ * The Mi 10T (SM8250) has no Gunyah: its watchdog is the APSS one, written directly as Linux's watchdog_v2.c does
+ * (kona.dtsi qcom,msm-watchdog at 0x17c10000; a 32765 Hz count). If the firmware leaves it running, it is fed here.
+ */
+#define APSS_WDT_BASE      0x17c10000ul
+#define APSS_WDT_RST       0x04
+#define APSS_WDT_EN        0x08
+#define APSS_WDT_STS       0x0c
+#define APSS_WDT_BARK      0x10
+#define APSS_WDT_BITE      0x14
+#define APSS_WDT_HZ        32765u
+static int wdt_apss;                /* wdt_armed, by the APSS registers rather than the hypervisor */
+
+static inline uint32_t
+apss_wdt_rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(uintptr_t)(APSS_WDT_BASE + off);
+}
+
 static void
 wdt_pet(void)
 {
-	if (wdt_armed) {
+	if (wdt_armed && wdt_apss) {
+		*(volatile uint32_t *)(uintptr_t)(APSS_WDT_BASE + APSS_WDT_RST) = 1;
+		__asm__ volatile ("dsb sy" ::: "memory");
+	} else if (wdt_armed) {
 		smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	}
 }
@@ -2515,7 +2537,9 @@ wdt_set_ms(uint64_t ms)
 	if (ms > 65000) {
 		ms = 65000;
 	}
-	if (wdt_armed) {
+	if (wdt_armed && wdt_apss) {
+		wdt_pet();              /* (the firmware's bark and bite times are kept: only fed) */
+	} else if (wdt_armed) {
 		smc_call(VIRT_WDT_SET_TIME, ms, ms, NULL, NULL);
 		smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	}
@@ -2526,6 +2550,19 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
+	if (PLAT == &platform_apollo) {
+		uint32_t en = apss_wdt_rd(APSS_WDT_EN), bark = apss_wdt_rd(APSS_WDT_BARK), bite = apss_wdt_rd(APSS_WDT_BITE);
+
+		print("watchdog: APSS at %x: enable %x, status %x, bark %d ms, bite %d ms%s\n", (uint64_t)APSS_WDT_BASE, (uint64_t)en,
+		    (uint64_t)apss_wdt_rd(APSS_WDT_STS), (uint64_t)bark * 1000 / APSS_WDT_HZ, (uint64_t)bite * 1000 / APSS_WDT_HZ,
+		    (en & 1) ? ": RUNNING, fed from here on" : ": off");
+		if (en & 1) {
+			wdt_apss = 1;
+			wdt_armed = 1;
+			wdt_pet();
+		}
+		return;
+	}
 	if (PLAT != &platform_redwood) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
@@ -2951,9 +2988,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
-		/* (the Mi 10T's own battery driver, devices/mi-10t/xnu: hakios.apollo_battery.c, reads the same page) */
-		battery_requested |= starts_with(c, "apollo_battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[16] == 0 || c[16] == ' ');
+		/*
+		 * (the Mi 10T's own battery driver, devices/mi-10t/xnu: hakios.apollo_battery.c, reads the PMIC's gauge itself; it
+		 * reads this page only with apollo_battery_source=loader. Otherwise the UEFI's charger drivers are not called while
+		 * the kernel runs: they and the kernel's own SPMI users would share the arbiter.)
+		 */
+		battery_requested |= starts_with(c, "apollo_battery_source=loader") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[28] == 0 || c[28] == ' ');
 		charge_requested |= starts_with(c, "apollo_charge=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[15] == 0 || c[15] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
@@ -3080,7 +3121,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ba->commandLine[n++] = *c;
 		}
 	}
-	if (wdt_armed) {
+	if (wdt_armed && !wdt_apss) {
 		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 			ba->commandLine[n++] = *c;
 		}
@@ -3628,13 +3669,26 @@ usb_start(void)
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
  * state changed. Keeps the watchdog fed while idle.
  */
+/*
+ * A transfer that is part of a command's data (a download's chunks, an upload, a reply) is given USB_XFER_LIMIT_S to
+ * finish; the wait for the next command has no limit. On the Mi 10T a 2.3 GB "stage" sometimes stopped part-way for
+ * good (28 October: about one upload in four, the loader still on the bus, never answering again): the transfer is now
+ * aborted on the controller, said, and the command fails, so that the host can try again instead of the phone being
+ * reset by hand.
+ */
+#define USB_XFER_LIMIT_S        10
+static int usb_wait_limited;    /* set by usb_rx_data() and usb_tx() for the one wait they make */
+static uint32_t usb_aborts;
+
 static int64_t
 usb_wait(uint8_t endpoint)
 {
 	/* static: a long transfer is many short waits, and the watchdog must be fed across them */
 	static uint64_t last_pet;
 	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
+	int limited = usb_wait_limited;
 
+	usb_wait_limited = 0;
 	for (;;) {
 		uint32_t msg = UsbDeviceEventNoEvent;
 		uint64_t size = 0;
@@ -3647,6 +3701,14 @@ usb_wait(uint8_t endpoint)
 		}
 		/* with a kernel running, a host that went away must not keep this core from watching it */
 		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+			return -1;
+		}
+		if (limited && READ_SYSREG(CNTVCT_EL0) - began > USB_XFER_LIMIT_S * freq) {
+			efi_status s = USB->abort_xfer != NULL ? USB->abort_xfer(endpoint) : EFI_UNSUPPORTED;
+
+			usb_aborts++;
+			print("usb: the transfer on endpoint %x did not finish in %d s: aborted (%x), %d so far\n", (uint64_t)endpoint,
+			    (uint64_t)USB_XFER_LIMIT_S, s, (uint64_t)usb_aborts);
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
@@ -3672,6 +3734,17 @@ usb_rx(uint8_t *buf, uint64_t len)
 	return usb_wait(USB_EP_OUT);
 }
 
+/* a chunk of a command's data: the wait has a limit (usb_wait()) */
+static int64_t
+usb_rx_data(uint8_t *buf, uint64_t len)
+{
+	if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
+		return -1;
+	}
+	usb_wait_limited = 1;
+	return usb_wait(USB_EP_OUT);
+}
+
 static int64_t
 usb_tx(const uint8_t *data, uint64_t len)
 {
@@ -3681,6 +3754,7 @@ usb_tx(const uint8_t *data, uint64_t len)
 	if (EFI_ERROR(USB->send(USB_EP_IN, len, usb_tx_buf))) {
 		return -1;
 	}
+	usb_wait_limited = 1;
 	return usb_wait(USB_EP_IN);
 }
 
@@ -3794,8 +3868,9 @@ fb_command(char *cmd)
 			fb_reply_data(total);
 			while (got < total) {
 				uint64_t want = total - got > USB_CHUNK ? USB_CHUNK : total - got;
-				int64_t r = usb_rx(usb_rx_buf, want);
+				int64_t r = usb_rx_data(usb_rx_buf, want);
 				if (r <= 0) {
+					print("usb: download: %d of %d bytes, then the transfer failed\n", got, total);
 					break;
 				}
 				memcpy(dest + got, usb_rx_buf, (size_t)r);
