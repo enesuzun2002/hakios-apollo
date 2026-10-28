@@ -2903,6 +2903,52 @@ choose_window(const struct payload_info *pi)
 static int starts_with(const char *s, const char *prefix);
 
 /*
+ * The Mi 10T's real-time clock: the PM8150's (SPMI slave 0, peripheral 0x60 RTC_RW, 4 bytes of seconds at 0x6048, as
+ * Linux's rtc-pm8xxx reads it), through the PMIC arbiter's observer channel as the kernel's hakios.apollo_battery.c
+ * reads the charger. It runs whenever the battery is in -- unlike UEFI's GetTime here, which started from the same
+ * second of 2018 at every boot. The count is not the date (Android keeps the offset): 0 when it cannot be read.
+ */
+static uint64_t
+apollo_pmic_seconds(void)
+{
+	const uint64_t core = 0x0c440000UL, observer = 0x0e600000UL;
+	uint32_t channels = *(volatile uint32_t *)(core + 0x004) & 0x7ff, want = 0x0 << 8 | 0x60;
+	uint64_t channel = 0;
+	uint32_t first = 0, again = 0;
+
+	if (channels == 0 || channels > 512) {
+		return 0;
+	}
+	for (uint32_t n = 0; n < channels; n++) {
+		if (((*(volatile uint32_t *)(core + 0x900 + 4 * n) >> 8) & 0xfff) == want) {
+			channel = observer + 0x80UL * n;
+			break;
+		}
+	}
+	if (channel == 0) {
+		return 0;
+	}
+	for (int pass = 0; pass < 3; pass++) {
+		uint32_t status = 0;
+		uint64_t began = READ_SYSREG(CNTVCT_EL0), freq = READ_SYSREG(CNTFRQ_EL0);
+
+		*(volatile uint32_t *)(channel + 0x00) = 1u << 27 | 0x48u << 4 | 3;      /* extended read, 4 bytes at 0x48 */
+		do {
+			status = *(volatile uint32_t *)(channel + 0x08);
+		} while (!(status & 1) && READ_SYSREG(CNTVCT_EL0) - began < freq / 500);
+		if (!(status & 1) || (status & 0xe)) {
+			return 0;
+		}
+		again = *(volatile uint32_t *)(channel + 0x18);
+		if (pass > 0 && (again & 0xff) >= (first & 0xff)) {
+			return again;   /* (two reads within the same second's low byte: no carry between the bytes) */
+		}
+		first = again;
+	}
+	return 0;
+}
+
+/*
  * The Mi 10T's time for a run from the phone. Its clock (the PMIC's) was never set -- Android keeps an offset to it
  * on its own encrypted partition --, so this keeps one too, in the last block of logdump: a run with epoch= (from a
  * PC, xl) stores epoch less the clock; a run without one gets the clock plus that, as epoch=. Returns what to add to
@@ -2912,13 +2958,16 @@ static uint64_t
 apollo_time(const char *cmdline)
 {
 	efi_block_io *bio = find_log_partition();
-	uint64_t clock = firmware_seconds(1), given = 0, bs, last;
+	uint64_t clock = apollo_pmic_seconds(), given = 0, bs, last;
 	int64_t *rec;
 
 	for (const char *c = cmdline; *c; c++) {
 		if (starts_with(c, "epoch=") && (c == cmdline || c[-1] == ' ')) {
 			given = parse_number(c + 6, 10);
 		}
+	}
+	if (clock == 0) {
+		print("time: the PMIC's clock could not be read\n");
 	}
 	if (bio == NULL || clock == 0 || !hc_list_is_uefis()) {
 		return 0;
@@ -2931,7 +2980,7 @@ apollo_time(const char *cmdline)
 	rec = (int64_t *)(void *)block_buffer;
 	if (given != 0) {
 		memset(block_buffer, 0, bs);
-		memcpy(block_buffer, "HAKITIME", 8);
+		memcpy(block_buffer, "HAKIRTC1", 8);
 		rec[1] = (int64_t)given - (int64_t)clock;
 		if (!EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, last, bs, block_buffer))) {
 			bio->flush_blocks(bio);
@@ -2939,7 +2988,7 @@ apollo_time(const char *cmdline)
 		print("time: %d s from the PC, the clock says %d: offset kept\n", given, clock);
 		return 0;
 	}
-	if (memcmp(block_buffer, "HAKITIME", 8) != 0) {
+	if (memcmp(block_buffer, "HAKIRTC1", 8) != 0) {
 		print("time: no offset kept (no run from a PC yet): the clock as it is\n");
 		return 0;
 	}
@@ -4364,8 +4413,10 @@ apollo_bcb(int set)
 static int
 apollo_end_of(const char *klog, uint64_t len)
 {
-	static const char halted[] = "CPU halted", reboot[] = "MACH Reboot";
-	uint64_t from = len > 65536 ? len - 65536 : 0;
+	/* (the kernel's own lines reach only its message buffer, which may not be in what comes back; its shutdown says
+	 * this one into the log itself: bsd/kern/kern_shutdown.c) */
+	static const char halted[] = "shutdown: host_reboot: halt", reboot[] = "shutdown: host_reboot: restart";
+	uint64_t from = 0;
 	int what = 0;
 
 	if (klog == NULL || len > (64u << 20)) {
@@ -4376,8 +4427,6 @@ apollo_end_of(const char *klog, uint64_t len)
 			what = 'h';
 		} else if (i + sizeof(reboot) - 1 <= len && memcmp(klog + i, reboot, sizeof(reboot) - 1) == 0) {
 			what = 'r';
-		} else if (klog[i] == 'p' && i + 6 <= len && memcmp(klog + i, "panic(", 6) == 0) {
-			what = 0;       /* a panic after it: not an orderly end */
 		}
 	}
 	return what;
