@@ -58,12 +58,9 @@ On the POCO X5 Pro:
 | `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
 | Sileo, Procursus packages, SSH into the phone | |
 
-On the Mi 10T, the port is newer. It has its own drivers for the touch screen, buttons, battery and
-charger, CPU clocks, display and backlight, Adreno 650 GPU, audio DSP with the CS35L41 speaker
-amplifiers and the two microphones, AW8697 vibration motor, and QCA6390 Wi-Fi over PCIe. Each one is off unless its own
-`apollo_*` boot-arg is given. Their state, and what is still provisional, are in
-[`devices/mi-10t/README.md`](devices/mi-10t/README.md). The modem and the cameras are not ported to
-this phone.
+**Xiaomi Mi 10T:** iOS boots to the home screen with touch, GPU-accelerated UI, speakers and both
+microphones, vibration, Wi-Fi, battery and brightness. Cellular, Bluetooth and the cameras are not ported.
+**The step-by-step guide is [devices/mi-10t/README.md](devices/mi-10t/README.md).**
 
 ## Quick start in QEMU
 
@@ -99,18 +96,9 @@ XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 
 
 `tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
 
-On the Mi 10T, the steps are its own, and its images are built with `DEVICE=mi-10t` so that only its
-firmware goes in:
-
-```sh
-devices/mi-10t/pull-firmware.sh                 # the Mi 10T's firmware over adb -> fw-*-apollo/
-devices/mi-10t/tools/mk-ath11k.sh               # its Wi-Fi driver object, linked by make kernel
-make kernel loader
-DEVICE=mi-10t RC_JOBS=../devices/mi-10t/userland/rc.jobs GL=1 make images
-devices/mi-10t/run.sh 900                       # a 15-minute session with every Mi 10T driver on
-```
-
-Its boot-args (`apollo_touch=1`, `apollo_gpu=N`, `apollo_wifi=N` and the rest) are listed in its README.
+On the Mi 10T, follow [its guide](devices/mi-10t/README.md): the firmware is pulled with
+`devices/mi-10t/pull-firmware.sh`, the images are built with `DEVICE=mi-10t`, and `devices/mi-10t/run.sh` starts a
+session.
 
 The POCO's main kernel arguments (the full list is in `docs/ru/notes.md`):
 
