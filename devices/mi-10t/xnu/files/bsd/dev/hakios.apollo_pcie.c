@@ -33,6 +33,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/hakios.apollo_input.h>
 #include <sys/hakios.apollo_wifi.h>
+#include <sys/hakios.sta.h>
+#include <kern/kalloc.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -3609,6 +3611,57 @@ off:
 	return EIO;
 }
 
+/*
+ * With wifi_station=1 the driver has given its station to the kernel (sys/hakios.sta.h), and iOS's Wi-Fi side has it: the network
+ * of fw/network (the small image's; devices/mi-10t/userland/firmware.sh) is then joined the way anybody joins one, by asking the
+ * station, as hakios.wifi.c's join_given() does on redwood. iOS may ask for another later, or for none. wifi_file=0: not joined.
+ * (wifi_join=1 is the driver joining by itself instead, with no station for iOS: Settings shows no networks then.)
+ */
+extern int apollo_lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length);
+
+static void
+join_given(void)
+{
+	static struct hakios_sta_join what;
+	struct hakios_sta_state *state;
+	unsigned name_length = sizeof(what.ssid), passphrase_length = sizeof(what.passphrase);
+	uint32_t station = 0, given = 1;
+	uint64_t began = now_us();
+	int error;
+
+	if (!PE_parse_boot_argn("wifi_station", &station, sizeof(station)) || station == 0) {
+		return;
+	}
+	if (PE_parse_boot_argn("wifi_file", &given, sizeof(given)) && given == 0) {
+		say("apollo wifi: the network of the file is not joined at the start (wifi_file=0): the radio waits to be asked\n");
+		return;
+	}
+	bzero(&what, sizeof(what));
+	if (!apollo_lx_os_network(what.ssid, &name_length, what.passphrase, &passphrase_length)) {
+		say("apollo wifi: no network to join from fw/network: the radio waits to be asked\n");
+		return;
+	}
+	what.ssid_length = (uint8_t)name_length;
+	what.passphrase_length = (uint8_t)passphrase_length;
+	what.security = HAKIOS_STA_WPA2_PSK;
+	error = hakios_sta_ask_join_standing(&what);
+	bzero(&what, sizeof(what));
+	for (unsigned waited = 0; error == 0 && hakios_sta_busy() && waited < 300; waited++) {
+		sleep_ms(100);
+	}
+	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
+		return;
+	}
+	hakios_sta_state(state);
+	if (state->phase == HAKIOS_STA_JOINED) {
+		say("apollo wifi: THE NETWORK OF THE FILE IS JOINED, %llu ms after it was asked for\n", (now_us() - began) / 1000);
+	} else {
+		say("apollo wifi: THE NETWORK OF THE FILE IS NOT JOINED (%d, phase %d, %d): the radio waits to be asked\n", error,
+		    state->phase, state->last_error);
+	}
+	kfree_data(state, sizeof(*state));
+}
+
 /* apollo_wifi=1 to 5: the stages up to W2c as before; 5 goes on: the chip to AMSS, IPCR, the QRTR transport, then the apollo ath11k object */
 static void
 apollo_wifi_thread(__unused void *parameter, __unused wait_result_t result)
@@ -3628,6 +3681,9 @@ apollo_wifi_thread(__unused void *parameter, __unused wait_result_t result)
 			if (error == 0) {
 				error = apollo_lx_start();
 				say("apollo wifi: stage 5: apollo_lx_start: %d\n", error);
+			}
+			if (error == 0) {
+				join_given();
 			}
 		}
 	} else {
