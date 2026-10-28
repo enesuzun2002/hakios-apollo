@@ -21,6 +21,10 @@ apollo_fw_install ../fw-audio-apollo/adsp.mdt ../fw-audio-apollo/adsp.b[0-9][0-9
 # speaker's (0x40) and the earpiece's (0x42)
 apollo_fw_install ../fw-audio-apollo/cs35l41-dsp1-spk-prot-revb2.wmfw ../fw-audio-apollo/cs35l41-dsp1-spk-prot-revb2.bin \
 	../fw-audio-apollo/cs35l41-dsp1-spk-prot-RCV-revb2.bin
+# the main microphone's path 1 (hakios.apollo_mic.c, apollo_mic_path=1): Xiaomi's topology and calibration for the
+# device path, written out of the phone's ACDB by devices/mi-10t/tools/acdb-mic.py
+apollo_fw_install ../fw-audio-apollo/mic_topology_v2.bin ../fw-audio-apollo/mic_topology_v1.bin \
+	../fw-audio-apollo/mic_topology_legacy.bin ../fw-audio-apollo/mic_audproc.bin
 # the GPU's (hakios.apollo_adreno.c, apollo_gpu=N): a650_gmu.bin, a650_sqe.fw, a650_zap.mdt and its a650_zap.bNN
 apollo_fw_install ../fw-gpu-apollo/a650_*
 # the vibration motor's waveforms (hakios.apollo_haptic.c, apollo_haptic=N)

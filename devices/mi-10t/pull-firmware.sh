@@ -23,6 +23,15 @@ pull fw-gpu-apollo $(on_phone /vendor/firmware/a650_gmu.bin /vendor/firmware/a65
 # the audio DSP's image (hakios.apollo_adsp.c) and the CS35L41 amplifiers' protection firmware (hakios.apollo_cs35l41.c)
 pull fw-audio-apollo $(on_phone /vendor/firmware_mnt/image/adsp.*) /vendor/firmware/cs35l41-dsp1-spk-prot-revb2.wmfw \
 	/vendor/firmware/cs35l41-dsp1-spk-prot-revb2.bin /vendor/firmware/cs35l41-dsp1-spk-prot-RCV-revb2.bin
+# the main microphone's path 1 (hakios.apollo_mic.c): Xiaomi's ACDB (world-readable, no root needed), and out of it
+# the device path's topology and calibration (devices/mi-10t/tools/acdb-mic.py: mic_topology_v2/v1/legacy.bin,
+# mic_audproc.bin)
+pull fw-audio-apollo/acdb /vendor/etc/acdbdata/Tutu/Tutu_Handset_cal.acdb /vendor/etc/acdbdata/Tutu/Tutu_Global_cal.acdb
+if [ -f fw-audio-apollo/acdb/Tutu_Handset_cal.acdb ] && [ -f fw-audio-apollo/acdb/Tutu_Global_cal.acdb ]; then
+	python3 devices/mi-10t/tools/acdb-mic.py fw-audio-apollo/acdb/Tutu_Handset_cal.acdb \
+		fw-audio-apollo/acdb/Tutu_Global_cal.acdb fw-audio-apollo ||
+		echo "pull-firmware.sh: acdb-mic.py failed: the microphone keeps to path 0"
+fi
 # the vibration motor's waveforms (hakios.apollo_haptic.c; Android's ueventd loads it from /vendor/firmware)
 pull fw-haptic-apollo /vendor/firmware/aw8697_haptic.bin
 # the touch chip's (hakios.apollo_touch.c): Android's kernel has it built in, so it is usually not a file on the phone
