@@ -36,6 +36,8 @@
  *    SMMU stream of the display), with the pipe that scans the boot framebuffer marked.
  *  - apollo_display_flip(phys, stride) / apollo_display_flip_latched(): the pipe's SRC0_ADDR is written and the pipe's bit
  *    in CTL_FLUSH set; the hardware takes the new address at the next frame's start and clears the bit.
+ *  - apollo_flip=1: three frames, the flips to them queued and written at the frame start by a thread ("apollo flip"), see
+ *    the triple buffering below; apollo_flip_latest=0: a queued frame is never taken back for a newer one.
  *  - apollo_flip_test=S: 20 s after the init, two buffers (red, green) are flipped between for S seconds and timed (not with
  *    apollo_flip=1, whose frames they are).
  * The catalog offsets of Linux (catalog/dpu_6_0_sm8250.h) are relative to 0x0ae01000 (its ctl_0 is at 0x1000, and the CTL
@@ -45,12 +47,14 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>         /* assert_wait, thread_block, thread_wakeup */
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <console/video_console.h>
+#include <sys/hakios.apollo_input.h>  /* apollo_frames_flip(), apollo_frames_acquire() */
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -508,6 +512,7 @@ static uint32_t boot_stride;            /* ... and the boot framebuffer's, which
 static uint32_t flip_bit;               /* the pipe's bit in CTL_FLUSH */
 static uint64_t flip_last_us;           /* the last flip's time to latch, microseconds, ~0: it did not */
 static uint32_t flip_frames_before, flip_frames_after;
+static bool scan_stopped;               /* apollo_display_quiesce(): the run ends, the triple buffering writes the pipe no more */
 
 /*
  * The boot framebuffer's physical address. The text console's vinfo (the structure MiniIOMobileFramebuffer takes
@@ -722,6 +727,7 @@ apollo_display_flip(uint64_t phys, uint32_t stride)
 void
 apollo_display_quiesce(void)
 {
+	scan_stopped = true;                    /* (a queued frame of apollo_flip=1 is not written after this) */
 	if (!flip_ready() || fb_phys == 0 || fb_phys >= (1ull << 32)) {
 		return;
 	}
@@ -1050,21 +1056,68 @@ out:
 /*
  * MiniIOMobileFramebuffer draws into one of three frames and flips the pipe to it: frame 0 is the boot framebuffer (fb_phys;
  * the caller already has it mapped, as fBase, and passes that address in va[0] of apollo_scanout_get), frames 1 and 2 are
- * flip_buf[0..1] (the display reservation behind it, mapped by flip_reserve). One thread (the presenter) calls these.
- * scan_front: the frame the panel scans, as far as we have seen it latch; scan_pending: the one flipped to but not yet seen
- * latched, or SCAN_NONE.
+ * flip_buf[0..1] (the display reservation behind it, mapped by flip_reserve).
+ * scan_front: the frame the panel scans, as far as we have seen it latch; scan_pending: the one written to the pipe (its
+ * CTL_FLUSH bit set) but not yet seen latched, or SCAN_NONE; scan_queued: one drawn and asked to be flipped to while another
+ * was pending -- not written to the pipe yet (the pipe has one set of shadow registers: a second write before the latch
+ * would race the frame start, and which of the two the panel then scans could not be told), or SCAN_NONE.
+ *
+ * The flip does not wait (it used to: show() slept until the flip before had latched, 9 to 15 ms of every frame at 60 Hz,
+ * 26 October -- and since a frame that came while one was pending was written only at the next frame start, every frame was
+ * shown a refresh later than it could have been, as long as frames kept coming). The panel (a video-mode DSI panel, INTF_1's
+ * timing engine running, see the top of this file) takes a flushed pipe's registers at the frame start. apollo_scanout_flip():
+ *  - nothing pending: the pipe is written at once (shown from the next frame start), as before;
+ *  - one pending, apollo_flip_latest=1 (the default) and the same stride: the pipe's SRC0_ADDR is written over with the new
+ *    frame and the flush bit set again: latest wins, the pending one is never shown -- or, if the frame start came between
+ *    the two writes, it is shown for that one refresh. Which of the two the frame start took cannot be told, so the replaced
+ *    frame is HELD (scan_held: neither drawn into nor handed out) until the new pending one is seen latched: the flush bit
+ *    read clear after our own write of it means the pipe has taken our SRC0_ADDR, whatever happened in between;
+ *  - else (apollo_flip_latest=0, or a CPU frame after a GPU one: another stride, which two writes cannot change at once
+ *    safely) the frame is queued (scan_queued; one queued later replaces it, latest wins) and written the moment the pending
+ *    one is seen latched -- by whoever looks first under scan_lock (scan_update), at the latest by a thread of its own,
+ *    "apollo flip", which looks right after each frame start: written then, it is shown from the next.
+ * With apollo_flip_latest=1 a queued frame is also given back to whoever needs a frame to draw into when none is free
+ * (apollo_scanout_take, apollo_scanout_acquire), the newer picture taking the older's place.
+ * Never drawn into: scan_front (scanned), scan_pending (latched at the next frame start), scan_held (perhaps scanned); a
+ * queued frame is in no register of the pipe, so it may be taken back.
+ *
+ * Where the frame start is: the timing engine's line counter (INTF_LINE_COUNT) gives the line in the frame; the line at which
+ * the CTL_FLUSH bit clears is learned (scan_latch_line) by looking every 250 us until a latch is seen, then the thread sleeps
+ * until shortly after that line in every frame. No interrupt: the MDSS's interrupt (the DPU's INTF vsync / CTL start) goes
+ * through the MDSS's own interrupt controller, which this kernel has no driver for.
  */
 #define SCAN_NONE       0xffffffffu
 static unsigned scan_front;
 static unsigned scan_pending = SCAN_NONE;
+static unsigned scan_queued = SCAN_NONE;
+static bool scan_queued_gpu;            /* the queued frame was drawn by the GPU (its stride) */
+static bool scan_pending_gpu;           /* ... and the pending one */
+static uint32_t scan_held;              /* a bit per frame: replaced while pending, perhaps scanned until the pending one latches */
+static uint64_t scan_asked_abs[3];      /* when the flip to each frame was asked for (apollo_scanout_flip) */
+static uint64_t scan_written_abs;       /* when the pending one was written to the pipe */
+static bool scan_latest = false;        /* apollo_flip_latest=1: a newer frame replaces a pending one (off: on the phone it dropped frames that came two in one refresh, 28 October) */
+static uint32_t scan_latches;           /* latches seen */
+
+/* the "apollo flip" thread: where in the frame the flush bit clears, and its looks */
+#define SCAN_LINE_UNKNOWN       0xffffffffu
+#define SCAN_POLL_NS            250000ULL       /* looks while the latch's line is not known */
+#define SCAN_SHORT_NS           150000ULL       /* looks just after the latch's line, while a flip written before it is pending */
+#define SCAN_WINDOW_NS          1500000ULL      /* ... for this long after it; still pending then: the line was wrong */
+#define SCAN_AFTER_NS           100000ULL       /* the look after the latch's line, this much after it */
+#define SCAN_STUCK_NS           20000000ULL     /* a flip pending for longer than FLIP_TIMEOUT_US (the panel off?): looks this far apart */
+static uint32_t scan_latch_line = SCAN_LINE_UNKNOWN;
+static uint64_t scan_look_abs;          /* the thread's last look that found a flip pending (0: none) */
+static uint32_t scan_learned;           /* (times the line was learned: logged the first few) */
+static char scan_event;                 /* the thread sleeps on it: a flip is pending or queued */
 
 /*
- * The state machine of the three frames is here, behind one lock: the presenter (MiniIOMobileFramebuffer's show()) and the
- * window server's calls (ApolloGPU's kApolloScanout, apollo_gpu_present=1) both move it. A frame is FREE when it is neither
- * scan_front nor scan_pending nor scan_reserved: reserved is a frame that someone is drawing into -- the presenter's CPU
- * copy (apollo_scanout_take) or the GPU, for the window server (apollo_scanout_acquire) -- from the moment it is handed out
- * until the flip to it (apollo_scanout_flip) or its release. The flip to a frame makes it scan_pending and then scan_front;
- * the one that was in front before it is free again once the new one has latched.
+ * The state machine of the three frames is here, behind one lock: the presenter (MiniIOMobileFramebuffer's show()), the
+ * window server's calls (ApolloGPU's kApolloScanout, apollo_gpu_present=1) and the "apollo flip" thread all move it. A frame
+ * is FREE when it is neither scan_front nor scan_pending nor scan_queued nor held nor reserved: reserved is a frame that someone
+ * is drawing into -- the presenter's CPU copy (apollo_scanout_take) or the GPU, for the window server (apollo_scanout_acquire)
+ * -- from the moment it is handed out until the flip to it (apollo_scanout_flip) or its release. The flip to a frame makes it
+ * scan_pending (written over the one pending, which is then held, or queued behind it), then scan_front; the one that was in
+ * front before it, and the held ones, are free again once the new one has latched.
  */
 static LCK_GRP_DECLARE(scan_lck_grp, "apollo-scanout");
 static LCK_MTX_DECLARE(scan_lock, &scan_lck_grp);
@@ -1089,46 +1142,113 @@ apollo_scanout_get(unsigned *count, vm_offset_t va[3], uint64_t pa[3], uint32_t 
 	lck_mtx_lock(&scan_lock);
 	scan_front = 0;
 	scan_pending = SCAN_NONE;
+	scan_queued = SCAN_NONE;
+	scan_held = 0;
 	lck_mtx_unlock(&scan_lock);
 	*count = 3;
 	return 3;
 }
 
-/* with the lock held */
-static bool
-scan_latched(void)
+/* a frame's line period in nanoseconds (0: not known) */
+static uint64_t
+scan_line_ns(void)
 {
-	if (scan_pending == SCAN_NONE) {
-		return true;
+	if (measured_mhz == 0 || frame_lines == 0) {
+		return 0;
 	}
-	if (!apollo_display_flip_latched()) {
+	return 1000000000000ULL / ((uint64_t)measured_mhz * frame_lines);
+}
+
+/* nanoseconds since the latch's line (or the frame's first line while that is not known), from the line counter */
+static uint64_t
+scan_since_latch_ns(uint32_t line)
+{
+	uint32_t at = scan_latch_line == SCAN_LINE_UNKNOWN ? 0 : scan_latch_line;
+
+	if (frame_lines == 0 || line >= frame_lines || at >= frame_lines) {
+		return 0;
+	}
+	return (uint64_t)((line + frame_lines - at) % frame_lines) * scan_line_ns();
+}
+
+/* with the lock held: frame `index` written to the pipe; true: it is scan_pending now */
+static bool
+scan_write(unsigned index, bool gpu)
+{
+	if (scan_stopped || !apollo_display_flip(index == 0 ? fb_phys : flip_phys[index - 1], gpu ? flip_gpu_stride : boot_stride)) {
 		return false;
 	}
-	scan_front = scan_pending;
-	scan_pending = SCAN_NONE;
+	scan_pending = index;
+	scan_pending_gpu = gpu;
+	scan_written_abs = mach_absolute_time();
 	return true;
 }
 
+/*
+ * With the lock held: if the pending flip has latched, its frame is the front now (and the one in front before it is free);
+ * then a queued frame is written to the pipe. True: nothing is pending (after this look; a queued frame written is pending).
+ */
+static bool
+scan_update(void)
+{
+	if (scan_pending != SCAN_NONE) {
+		uint64_t ns;
+
+		if (!apollo_display_flip_latched()) {
+			return false;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - scan_asked_abs[scan_pending], &ns);
+		apollo_frames_flip(APOLLO_FRAMES_FLIP_LATCHED, ns);
+		scan_latches++;
+		scan_front = scan_pending;
+		scan_pending = SCAN_NONE;
+		scan_held = 0;                          /* (the pipe scans the latched one: whatever it took before is behind it) */
+	}
+	if (scan_queued != SCAN_NONE) {
+		unsigned queued = scan_queued;
+
+		scan_queued = SCAN_NONE;
+		if (queued != scan_front && scan_write(queued, scan_queued_gpu)) {
+			apollo_frames_flip(APOLLO_FRAMES_FLIP_APPLIED, intf != 0 ? scan_since_latch_ns(rd(intf + INTF_LINE_COUNT)) : 0);
+			return false;
+		}
+		apollo_frames_flip(APOLLO_FRAMES_FLIP_FAILED, 0);      /* (the frame is nobody's now: free) */
+	}
+	return true;
+}
+
+/*
+ * A new flip may be asked for now. (Before the flips were queued this was "the one before has latched", and show() waited for
+ * it; now apollo_scanout_flip() always takes the frame -- queued if one is pending -- so it is true. The look updates the front.)
+ */
 bool
 apollo_scanout_latched(void)
 {
-	bool latched;
-
 	lck_mtx_lock(&scan_lock);
-	latched = scan_latched();
+	scan_update();
 	lck_mtx_unlock(&scan_lock);
-	return latched;
+	return true;
 }
 
-/* with the lock held: a frame that is not scanned, not waiting for its latch and nobody's; -1: none */
+/*
+ * With the lock held: a frame that is not scanned, not waiting for its latch, not queued and nobody's; -1: none. If there is
+ * none and `latest` (apollo_flip_latest=1), the queued frame, taken back: the caller draws a newer picture into it.
+ */
 static int
-scan_free(void)
+scan_free(bool latest)
 {
-	scan_latched();
+	scan_update();
 	for (unsigned i = 0; i < 3; i++) {
-		if (i != scan_front && i != scan_pending && !(scan_reserved & (1u << i))) {
+		if (i != scan_front && i != scan_pending && i != scan_queued && !((scan_reserved | scan_held) & (1u << i))) {
 			return (int)i;
 		}
+	}
+	if (latest && scan_latest && scan_queued != SCAN_NONE) {
+		int index = (int)scan_queued;
+
+		scan_queued = SCAN_NONE;
+		apollo_frames_flip(APOLLO_FRAMES_FLIP_TAKEN_BACK, 0);
+		return index;
 	}
 	return -1;
 }
@@ -1143,9 +1263,11 @@ apollo_scanout_take(void)
 	int index;
 
 	lck_mtx_lock(&scan_lock);
-	index = scan_free();
+	index = scan_free(true);
 	if (index >= 0) {
 		scan_reserved |= 1u << index;
+	} else {
+		apollo_frames_flip(APOLLO_FRAMES_FLIP_NONE_FREE, 0);
 	}
 	lck_mtx_unlock(&scan_lock);
 	return index;
@@ -1189,8 +1311,9 @@ apollo_scanout_gpu_info(unsigned index, uint64_t *phys, uint32_t *stride, uint32
 
 /*
  * A free frame for the window server to have the GPU draw into, reserved for it (apollo_scanout_release gives it back, the
- * flip to it ends the reservation); waits up to timeout_ms for one -- the swaps that are ahead of this frame free them -- and
- * returns -1 if there is none then. Not for the presenter's thread (it is the one that frees them).
+ * flip to it ends the reservation); waits up to timeout_ms for one -- the swaps that are ahead of this frame free them, and
+ * with apollo_flip_latest=1 a queued frame is taken back at once -- and returns -1 if there is none then. Not for the
+ * presenter's thread (it is the one that frees them).
  */
 int
 apollo_scanout_acquire(uint32_t timeout_ms)
@@ -1201,16 +1324,18 @@ apollo_scanout_acquire(uint32_t timeout_ms)
 		int index;
 
 		lck_mtx_lock(&scan_lock);
-		index = flip_gpu_stride != 0 && flip_reserved ? scan_free() : -1;
+		index = flip_gpu_stride != 0 && flip_reserved ? scan_free(true) : -1;
 		if (index >= 0) {
 			scan_reserved |= 1u << index;
 		}
 		lck_mtx_unlock(&scan_lock);
 		if (index >= 0) {
+			apollo_frames_acquire(mach_absolute_time() - began, true);
 			return index;
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 		if (flip_gpu_stride == 0 || !flip_reserved || ns / NSEC_PER_MSEC >= timeout_ms) {
+			apollo_frames_acquire(mach_absolute_time() - began, false);
 			return -1;
 		}
 		delay_for_interval(500, NSEC_PER_USEC);
@@ -1253,26 +1378,144 @@ apollo_scanout_take_mark(uint32_t swap, uint32_t surface)
 }
 
 /*
- * flip to frame `index`, which was drawn by the CPU (gpu false: the boot stride) or by the GPU (the stride of its rows);
- * refused while the one before has not latched (then nothing is written, and the frame is still reserved)
+ * Flip to frame `index`, which was drawn by the CPU (gpu false: the boot stride) or by the GPU (the stride of its rows). Does
+ * not wait: written to the pipe at once if no flip is pending; if one is, written over it (apollo_flip_latest=1, the same
+ * stride: the replaced one held until this one latches) or queued (replacing a frame queued before, which is then free and
+ * never shown) and written by whoever sees the pending one latch first. False: refused (the frame is the front, or the pipe
+ * could not be written): nothing was done, and the frame is still reserved.
  */
 bool
 apollo_scanout_flip(unsigned index, bool gpu)
 {
 	bool flipped = false;
+	uint64_t now = mach_absolute_time();
 
+	if (index > 2 || (gpu && flip_gpu_stride == 0)) {
+		return false;
+	}
 	lck_mtx_lock(&scan_lock);
-	if (index <= 2 && index != scan_front && scan_latched() && (!gpu || flip_gpu_stride != 0) &&
-	    apollo_display_flip(index == 0 ? fb_phys : flip_phys[index - 1], gpu ? flip_gpu_stride : boot_stride)) {
-		scan_pending = index;
-		scan_reserved &= ~(1u << index);
+	if (scan_update()) {
+		/* (nothing pending: written now, as before) */
+		if (index != scan_front) {
+			scan_asked_abs[index] = now;
+			flipped = scan_write(index, gpu);
+			if (flipped) {
+				apollo_frames_flip(APOLLO_FRAMES_FLIP_AT_ONCE, 0);
+			}
+		}
+	} else if (index == scan_pending) {
+		flipped = true;                         /* (it is on its way to the panel already) */
+	} else if (index != scan_front && scan_latest && gpu == scan_pending_gpu && !(scan_held & (1u << index))) {
+		/* latest wins on the pipe: SRC0_ADDR written over, the flush bit set again (see the triple buffering's comment) */
+		unsigned replaced = scan_pending;
+
+		scan_asked_abs[index] = now;
+		if (scan_write(index, gpu)) {
+			scan_held |= 1u << replaced;
+			apollo_frames_flip(APOLLO_FRAMES_FLIP_SUPERSEDED, 0);
+			if (scan_queued != SCAN_NONE && scan_queued != index) {
+				apollo_frames_flip(APOLLO_FRAMES_FLIP_REPLACED, 0);    /* (older than this one: never to be shown) */
+			}
+			scan_queued = SCAN_NONE;
+			flipped = true;
+		}
+	} else if (index != scan_front && !(scan_held & (1u << index))) {
+		if (scan_queued != SCAN_NONE && scan_queued != index) {
+			apollo_frames_flip(APOLLO_FRAMES_FLIP_REPLACED, 0);    /* (latest wins: the older is free again) */
+		}
+		scan_queued = index;
+		scan_queued_gpu = gpu;
+		scan_asked_abs[index] = now;
+		apollo_frames_flip(APOLLO_FRAMES_FLIP_QUEUED, 0);
 		flipped = true;
+	}
+	if (flipped) {
+		scan_reserved &= ~(1u << index);
+		thread_wakeup((event_t)&scan_event);
 	}
 	lck_mtx_unlock(&scan_lock);
 	return flipped;
 }
 
-/* sleep (1 ms steps, then a short spin for the last 2 ms) until the pending flip has latched, or timeout_us has passed */
+/*
+ * The "apollo flip" thread: while a flip is pending, it looks at the flush bit right after the line where it clears (or every
+ * 250 us until that line is known), so that a queued frame is written at the start of the refresh in which the one before it
+ * latched -- and shown from the next. When to look next, with the lock held; `line` is the line counter at this look.
+ */
+static uint64_t
+scan_next_look(uint64_t now, uint32_t line)
+{
+	uint64_t line_ns = scan_line_ns(), since, ns, written, deadline;
+
+	absolutetime_to_nanoseconds(now - scan_written_abs, &written);
+	if (line_ns == 0 || line >= frame_lines) {
+		ns = SCAN_POLL_NS;
+	} else if (written > FLIP_TIMEOUT_US * NSEC_PER_USEC) {
+		ns = SCAN_STUCK_NS;                     /* (the panel is off, or the timing engine stopped: no frame starts) */
+	} else if (scan_latch_line == SCAN_LINE_UNKNOWN) {
+		ns = SCAN_POLL_NS;
+	} else {
+		since = scan_since_latch_ns(line);
+		if (written > since + SCAN_SHORT_NS && since >= SCAN_WINDOW_NS) {
+			/* written well before this frame's latch line and still pending well after it: the line is not where it clears */
+			scan_latch_line = SCAN_LINE_UNKNOWN;
+			ns = SCAN_POLL_NS;
+		} else if (written > since && since < SCAN_WINDOW_NS) {
+			ns = SCAN_SHORT_NS;             /* (it should clear any moment) */
+		} else {
+			ns = (uint64_t)frame_lines * line_ns - since + SCAN_AFTER_NS;   /* the next frame's latch line, a little after */
+		}
+	}
+	nanoseconds_to_absolutetime(ns, &deadline);
+	return now + deadline;
+}
+
+static void
+scan_thread(void *arg __unused, wait_result_t wr_ __unused)
+{
+	lck_mtx_lock(&scan_lock);
+	for (;;) {
+		uint32_t latches = scan_latches, line;
+		uint64_t now, ns;
+
+		while (scan_pending == SCAN_NONE && scan_queued == SCAN_NONE) {
+			scan_look_abs = 0;
+			assert_wait((event_t)&scan_event, THREAD_UNINT);
+			lck_mtx_unlock(&scan_lock);
+			thread_block(THREAD_CONTINUE_NULL);
+			lck_mtx_lock(&scan_lock);
+			latches = scan_latches;
+		}
+		now = mach_absolute_time();
+		line = rd(intf + INTF_LINE_COUNT);
+		scan_update();
+		/*
+		 * A latch seen by a look that came soon after one which found the flip pending: the bit cleared between the two,
+		 * so at about this line (some 250 us late at most) -- where the thread looks from now on.
+		 */
+		if (scan_latches != latches && scan_look_abs != 0 && line < frame_lines) {
+			absolutetime_to_nanoseconds(now - scan_look_abs, &ns);
+			if (ns < SCAN_POLL_NS + SCAN_POLL_NS / 2 && scan_latch_line == SCAN_LINE_UNKNOWN) {
+				scan_latch_line = line;
+				if (scan_learned++ < 4) {
+					say("apollo flip: the flush bit clears by line %u of %u: flips are looked at there\n", line,
+					    frame_lines);
+				}
+			}
+		}
+		scan_look_abs = scan_pending != SCAN_NONE ? now : 0;
+		if (scan_pending == SCAN_NONE && scan_queued == SCAN_NONE) {
+			continue;
+		}
+		assert_wait_deadline_with_leeway((event_t)&scan_event, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
+		    scan_next_look(now, line), 0);
+		lck_mtx_unlock(&scan_lock);
+		thread_block(THREAD_CONTINUE_NULL);
+		lck_mtx_lock(&scan_lock);
+	}
+}
+
+/* the presenter used to sleep here until the pending flip had latched; flips are queued now (apollo_scanout_flip): no wait */
 void
 apollo_scanout_wait(uint32_t timeout_us)
 {
@@ -1333,6 +1576,22 @@ apollo_display_init(void)
 	}
 	if ((test != 0 || flip_mode == 1) && flip_ready()) {
 		flip_reserve();
+	}
+	if (flip_mode == 1 && flip_reserved) {
+		/* the flips of the triple buffering are queued, and written by this thread at the frame start (see apollo_scanout_flip) */
+		uint32_t latest = 1;
+		thread_t thread;
+
+		PE_parse_boot_argn("apollo_flip_latest", &latest, sizeof(latest));
+		scan_latest = latest != 0;
+		if (kernel_thread_start(scan_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_set_thread_name(thread, "apollo flip");
+			thread_deallocate(thread);
+			say("apollo flip: flips are queued, not waited for; a queued frame is %s\n", scan_latest ?
+			    "taken back for a newer one when no frame is free (apollo_flip_latest=1)" : "never taken back (apollo_flip_latest=0)");
+		} else {
+			say("apollo flip: no thread for the queued flips: they are written when the presenter or the window server looks\n");
+		}
 	}
 	if (test != 0 && flip_mode == 1) {
 		/* the test flips between frames 1 and 2 of the reservation, which apollo_flip=1 draws into and scans out */

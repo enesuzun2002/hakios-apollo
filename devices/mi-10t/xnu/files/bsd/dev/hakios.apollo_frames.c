@@ -9,13 +9,24 @@
  *     (refreshHz(), 60), delivered to backboardd.
  *   - apollo_frames_shown(): the end of IOMobileFramebuffer::show(), the presenter thread's work for one frame: the wait
  *     for the GPU (surface drawn), the wait for the panel's scan to leave the picture (apollo_display_wait_scanout) and
- *     the CPU copy/scale of the layers into the panel's memory (drawLayer, plus record()).
- * Every 2 seconds in which a frame was presented, one line "apollo frames: ..." is logged.
+ *     the CPU copy/scale of the layers into the panel's memory (drawLayer, plus record()). With apollo_flip=1 the flips are
+ *     queued (bsd/dev/hakios.apollo_display.c, apollo_scanout_flip): "scanout-wait" is then only the call that queues one,
+ *     near 0; where the waits went is in the third line.
+ *   - apollo_frames_flip(): hakios.apollo_display.c's triple buffering: each flip written at once (nothing pending) or queued
+ *     behind a pending one; when the queued ones were written (after the frame start: the "apollo flip" thread's promptness,
+ *     a flip written before the next frame start is shown from it); pending flips written over by a newer one (latest wins);
+ *     every latch, and the time from the flip's request to its latch (what a frame waits for the panel once it is drawn: under
+ *     a refresh, half of one on average, is the floor; more than one means frames wait in a queue); queued frames replaced or
+ *     taken back by a newer one (never shown); the presenter finding no frame.
+ *   - apollo_frames_acquire(): the window server's wait for a frame to have the GPU draw into (kScanoutAcquire; eagl.c gives
+ *     up after 50 ms, and the processor draws that swap): the wait the panel puts on CoreAnimation's own thread.
+ * Every 2 seconds in which a frame was presented, three lines "apollo frames: ..." are logged.
  */
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.apollo_input.h>  /* apollo_frames_flip(), apollo_frames_acquire() and their kinds */
 #include <sys/systm.h>
 
 /* into the loader's log as well (as the other apollo drivers) */
@@ -24,13 +35,16 @@ extern void loader_log_putc(char c);
 void apollo_frames_swap(uint64_t blocked_abs);
 void apollo_frames_vsync(void);
 void apollo_frames_shown(uint64_t gpu_abs, uint64_t scan_abs, uint64_t copy_abs, uint32_t on_scan);
+#define FLIP_KINDS      APOLLO_FRAMES_FLIP_KINDS
+#define FLIP_APPLIED    APOLLO_FRAMES_FLIP_APPLIED
+#define FLIP_LATCHED    APOLLO_FRAMES_FLIP_LATCHED
 
 static int say(const char *format, ...) __printflike(1, 2);
 
 static int
 say(const char *format, ...)
 {
-	char line[400];
+	char line[512];
 	va_list list;
 
 	va_start(list, format);
@@ -57,6 +71,10 @@ static uint64_t pr_count, pr_since_abs, pr_last_abs;
 static uint64_t pr_gap_sum_ns, pr_gap_max_ns, pr_gap_20, pr_gap_34, pr_gaps;
 static uint64_t pr_gpu_ns, pr_scan_ns, pr_copy_ns, pr_total_max_ns, pr_gpu_max_ns, pr_scan_max_ns, pr_copy_max_ns;
 static uint64_t pr_on_scan;
+
+/* flips (under hakios.apollo_display.c's scan_lock: one at a time; taken by the report with atomics) and the window server's waits */
+static uint64_t fl_count[FLIP_KINDS], fl_sum_ns[FLIP_KINDS], fl_max_ns[FLIP_KINDS];
+static uint64_t aq_count, aq_sum_ns, aq_max_ns, aq_waited, aq_failed;
 
 static bool
 on(void)
@@ -95,6 +113,33 @@ apollo_frames_vsync(void)
 	if (on()) {
 		__atomic_fetch_add(&vsync_ticks, 1, __ATOMIC_RELAXED);
 	}
+}
+
+void
+apollo_frames_flip(unsigned what, uint64_t ns)
+{
+	if (!on() || what >= FLIP_KINDS) {
+		return;
+	}
+	__atomic_fetch_add(&fl_count[what], 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&fl_sum_ns[what], ns, __ATOMIC_RELAXED);
+	max_to(&fl_max_ns[what], ns);
+}
+
+void
+apollo_frames_acquire(uint64_t wait_abs, bool got)
+{
+	uint64_t ns;
+
+	if (!on()) {
+		return;
+	}
+	ns = ns_of(wait_abs);
+	__atomic_fetch_add(&aq_count, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&aq_sum_ns, ns, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&aq_waited, ns > 500 * NSEC_PER_USEC, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&aq_failed, !got, __ATOMIC_RELAXED);
+	max_to(&aq_max_ns, ns);
 }
 
 void
@@ -193,6 +238,30 @@ apollo_frames_shown(uint64_t gpu_abs, uint64_t scan_abs, uint64_t copy_abs, uint
 		    ">34 ms: %llu; swap blocked on a full queue %llu times, %llu us total, max %llu us\n", sn,
 		    sgsum / (sg ? sg : 1) / NSEC_PER_MSEC, (sgsum / (sg ? sg : 1) / 10000) % 100, sgmax / NSEC_PER_MSEC,
 		    (sgmax / 10000) % 100, sg20, sg34, sbn, sb / 1000, sbmax / 1000);
+	}
+	{
+		uint64_t c[FLIP_KINDS], sum[FLIP_KINDS], mx[FLIP_KINDS];
+		uint64_t an = __atomic_exchange_n(&aq_count, 0, __ATOMIC_RELAXED);
+		uint64_t asum = __atomic_exchange_n(&aq_sum_ns, 0, __ATOMIC_RELAXED);
+		uint64_t amax = __atomic_exchange_n(&aq_max_ns, 0, __ATOMIC_RELAXED);
+		uint64_t awaited = __atomic_exchange_n(&aq_waited, 0, __ATOMIC_RELAXED);
+		uint64_t afailed = __atomic_exchange_n(&aq_failed, 0, __ATOMIC_RELAXED);
+
+		for (unsigned k = 0; k < FLIP_KINDS; k++) {
+			c[k] = __atomic_exchange_n(&fl_count[k], 0, __ATOMIC_RELAXED);
+			sum[k] = __atomic_exchange_n(&fl_sum_ns[k], 0, __ATOMIC_RELAXED);
+			mx[k] = __atomic_exchange_n(&fl_max_ns[k], 0, __ATOMIC_RELAXED);
+		}
+		say("apollo frames: flips %llu at once + %llu over a pending one + %llu queued (written %llu/%llu us after the frame "
+		    "start, mean/max), %llu queued replaced and %llu taken back (not shown), %llu failed; %llu latched (%llu/s), "
+		    "asked -> latched %llu/%llu us; presenter found no frame %llu times; window server's acquire %llu, waited "
+		    "%llu/%llu us (mean/max), %llu over 0.5 ms, %llu none in time\n", c[APOLLO_FRAMES_FLIP_AT_ONCE],
+		    c[APOLLO_FRAMES_FLIP_SUPERSEDED], c[APOLLO_FRAMES_FLIP_QUEUED],
+		    sum[FLIP_APPLIED] / (c[FLIP_APPLIED] ? c[FLIP_APPLIED] : 1) / 1000, mx[FLIP_APPLIED] / 1000,
+		    c[APOLLO_FRAMES_FLIP_REPLACED], c[APOLLO_FRAMES_FLIP_TAKEN_BACK], c[APOLLO_FRAMES_FLIP_FAILED],
+		    c[FLIP_LATCHED], c[FLIP_LATCHED] * 1000000000ULL / window,
+		    sum[FLIP_LATCHED] / (c[FLIP_LATCHED] ? c[FLIP_LATCHED] : 1) / 1000, mx[FLIP_LATCHED] / 1000,
+		    c[APOLLO_FRAMES_FLIP_NONE_FREE], an, asum / (an ? an : 1) / 1000, amax / 1000, awaited, afailed);
 	}
 	pr_count = pr_since_abs = 0;
 	pr_gap_sum_ns = pr_gap_max_ns = pr_gap_20 = pr_gap_34 = pr_gaps = 0;
