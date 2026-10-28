@@ -1205,25 +1205,12 @@ ApolloGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	/*
-	 * One of the panel's frames is drawn into only by the client that has it acquired (kScanoutAcquire, until
-	 * kScanoutQueue or kScanoutRelease): one that is on the panel, or another program's, is not to be written.
-	 * (The frames are made buffers before they are acquired -- the window server takes all three as textures
-	 * when it starts, userland/src/eagl.c -- so this is where it is checked, not in scanoutBuffer().)
+	 * A submission that names one of the panel's frames is not checked against kScanoutAcquire: Mesa sends the
+	 * blit into a frame after eagl.c has queued it (glClientWaitSync does not always flush, userland/src/eagl.c),
+	 * and keeps the frames in later submissions, so such a check refused about 1600 good submissions in a
+	 * 240 s run (27 October, -22 in MESA's flush_submit_list). Keeping other programs off the frames needs
+	 * eagl.c to hold a frame until its blit is submitted.
 	 */
-	for (uint32_t i = 0; i < request->nr_bos; i++) {
-		struct gpu_buffer * b = buffer(bos[i].handle);
-
-		if (b != NULL && b->scanout != 0 && !(fScanReserved & (1u << (b->scanout - 1)))) {
-			static uint32_t said;
-
-			IOLockUnlock(gGPULock);
-			if (said++ < 8) {
-				IOLog("ApolloGPU: a submission names panel frame %u, which the client has not acquired: not taken\n",
-				    b->scanout - 1);
-			}
-			goto out;
-		}
-	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
