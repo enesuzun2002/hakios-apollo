@@ -37,6 +37,8 @@
 #include <sys/hakios.qrtr.h>
 #include <sys/systm.h>
 
+extern void thread_set_thread_name(thread_t thread, const char *name);    /* (shown by the hitch tracer, apollo_hitch=1) */
+
 extern void loader_log_putc(char c);
 
 static int say(const char *format, ...) __printflike(1, 2);
@@ -461,6 +463,7 @@ apollo_qrtr_init(void)
 		qrtr_started = false;
 		return ENOMEM;
 	}
+	thread_set_thread_name(thread, "apollo qrtr");
 	thread_deallocate(thread);
 	apollo_ipcr_set_receive(qrtr_receive, NULL);    /* first: the chip may answer at once */
 	/* what qrtr_endpoint_register() has Linux do: HELLO, from {node 1, control port} to {the node, control port} */

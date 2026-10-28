@@ -2940,6 +2940,7 @@ battmgr_start(void)
 	}
 	battmgr.wanted = true;
 	if (kernel_thread_start(battmgr_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo battmgr");
 		thread_deallocate(thread);
 	}
 }
@@ -3134,6 +3135,7 @@ step_link(void)
 		printf("apollo adsp: %u: no thread\n", step);
 		return false;
 	}
+	thread_set_thread_name(thread, "apollo adsp link");
 	thread_deallocate(thread);
 	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
@@ -3366,6 +3368,7 @@ apollo_adsp_init(void)
 			printf("apollo adsp: no thread: the audio DSP is not brought up\n");
 			return;
 		}
+		thread_set_thread_name(thread, "apollo adsp start");
 		thread_deallocate(thread);
 		tell("apollo adsp: the audio DSP is being brought up beside the system's start (apollo_audio=%u)\n", on);
 		return;

@@ -3337,12 +3337,14 @@ ipcr_start(void)
 			ipcr.stop = true;
 			return ENOMEM;
 		}
+		thread_set_thread_name(thread, "wifi ipcr event");
 		thread_deallocate(thread);
 		if (kernel_thread_start(ipcr_deliver_thread, NULL, &thread) != KERN_SUCCESS) {
 			ipcr.deliver_alive = false;
 			ipcr.stop = true;
 			return ENOMEM;
 		}
+		thread_set_thread_name(thread, "wifi ipcr deliver");
 		thread_deallocate(thread);
 	}
 	/* mhi_prepare_channel(): mhi_init_chan_ctxt(), then the START command, UL (dir 0) first */
@@ -3802,6 +3804,7 @@ apollo_wifi_init(void)
 		apollo_lx_net_early();          /* en0 before iOS's Wi-Fi side looks (wifi_station=1 with wifi_mac=) */
 	}
 	if (kernel_thread_start(apollo_wifi_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo wifi");
 		thread_deallocate(thread);
 	}
 }

@@ -1304,6 +1304,7 @@ apollo_haptic_init(void)
 	PE_parse_boot_argn("apollo_haptic_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("apollo_haptic_after", &start_after_ms, sizeof(start_after_ms));
 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo haptic");
 		thread_deallocate(thread);
 	}
 }

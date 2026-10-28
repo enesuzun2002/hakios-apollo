@@ -227,6 +227,19 @@ static struct {
 	uint64_t making;                        /* ... and the time it took to make the others */
 } gGPUStat;
 
+/*
+ * The threads in gpuWait's loop right now (the presenter's wait for a drawn frame, a program's for its submission ...): read
+ * without the lock by the hitch tracer (bsd/dev/hakios.apollo_hitch.c, boot-arg apollo_hitch=1), from a timer interrupt.
+ */
+static uint32_t gGPUWaiters;
+
+extern "C" uint32_t apollo_gpu_waiters(void);
+uint32_t
+apollo_gpu_waiters(void)
+{
+	return __atomic_load_n(&gGPUWaiters, __ATOMIC_RELAXED);
+}
+
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
@@ -239,11 +252,18 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
+				__atomic_fetch_sub(&gGPUWaiters, 1, __ATOMIC_RELAXED);
 			}
 			return true;
 		}
 		if (mach_absolute_time() - began >= patience || gGPUReported) {
+			if (waited) {
+				__atomic_fetch_sub(&gGPUWaiters, 1, __ATOMIC_RELAXED);
+			}
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
+		}
+		if (!waited) {
+			__atomic_fetch_add(&gGPUWaiters, 1, __ATOMIC_RELAXED);
 		}
 		IOLockUnlock(gGPULock);
 		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);

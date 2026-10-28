@@ -527,6 +527,7 @@ apollo_cpufreq_init(void)
 	memory_bandwidth();
 	PE_parse_boot_argn("apollo_thermal", &thermal, sizeof(thermal));
 	if (thermal && kernel_thread_start(apollo_thermal_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo thermal");
 		thread_deallocate(thread);
 		say("apollo thermal: the cores slow down from %d degrees, and speed up again under %d\n", THERMAL_HOT / 10,
 		    THERMAL_COOL / 10);

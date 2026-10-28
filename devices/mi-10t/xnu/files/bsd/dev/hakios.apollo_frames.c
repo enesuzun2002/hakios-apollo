@@ -21,12 +21,14 @@
  *   - apollo_frames_acquire(): the window server's wait for a frame to have the GPU draw into (kScanoutAcquire; eagl.c gives
  *     up after 50 ms, and the processor draws that swap): the wait the panel puts on CoreAnimation's own thread.
  * Every 2 seconds in which a frame was presented, three lines "apollo frames: ..." are logged.
+ * With apollo_hitch=1 as well, the swaps and the windows feed the hitch tracer (bsd/dev/hakios.apollo_hitch.c): what the
+ * processors ran in a gap between two swaps, and over the windows.
  */
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/hakios.apollo_input.h>  /* apollo_frames_flip(), apollo_frames_acquire() and their kinds */
+#include <sys/hakios.apollo_input.h>  /* apollo_frames_flip(), apollo_frames_acquire() and their kinds; apollo_hitch_* */
 #include <sys/systm.h>
 
 /* into the loader's log as well (as the other apollo drivers) */
@@ -163,6 +165,7 @@ apollo_frames_swap(uint64_t blocked_abs)
 			__atomic_fetch_add(&sw_gap_34, gap > 34 * NSEC_PER_MSEC, __ATOMIC_RELAXED);
 			max_to(&sw_gap_max_ns, gap);
 		}
+		apollo_hitch_swap(last, now);           /* (apollo_hitch=1: a gap over apollo_hitch_ms is looked into) */
 	}
 	if (blocked_abs != 0) {
 		blocked = ns_of(blocked_abs);
@@ -187,6 +190,7 @@ apollo_frames_shown(uint64_t gpu_abs, uint64_t scan_abs, uint64_t copy_abs, uint
 	total = gpu + scan + copy;
 	if (pr_since_abs == 0) {
 		pr_since_abs = now;
+		apollo_hitch_window(true, 0);
 	}
 	pr_count++;
 	pr_gpu_ns += gpu;
@@ -263,6 +267,7 @@ apollo_frames_shown(uint64_t gpu_abs, uint64_t scan_abs, uint64_t copy_abs, uint
 		    sum[FLIP_LATCHED] / (c[FLIP_LATCHED] ? c[FLIP_LATCHED] : 1) / 1000, mx[FLIP_LATCHED] / 1000,
 		    c[APOLLO_FRAMES_FLIP_NONE_FREE], an, asum / (an ? an : 1) / 1000, amax / 1000, awaited, afailed);
 	}
+	apollo_hitch_window(false, window);
 	pr_count = pr_since_abs = 0;
 	pr_gap_sum_ns = pr_gap_max_ns = pr_gap_20 = pr_gap_34 = pr_gaps = 0;
 	pr_gpu_ns = pr_scan_ns = pr_copy_ns = pr_total_max_ns = pr_gpu_max_ns = pr_scan_max_ns = pr_copy_max_ns = 0;

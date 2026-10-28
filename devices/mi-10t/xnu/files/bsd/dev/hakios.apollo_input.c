@@ -19,6 +19,7 @@ apollo_input_init(void)
 	printf("apollo: the Mi 10T's drivers\n");
 	apollo_cpufreq_init();
 	apollo_display_init();           /* apollo_display=1: the panel's refresh, measured (and apollo_display_hz=N) */
+	apollo_hitch_init();             /* apollo_hitch=1 (with apollo_frames=1): what the cpus run in a gap between frames */
 	apollo_backlight_init();         /* apollo_backlight=P: the light of the panel */
 	apollo_adreno_init();            /* apollo_gpu=N: the GPU, step by step, before anything else draws or talks */
 	apollo_touch_init();

@@ -1167,6 +1167,7 @@ apollo_touch_init(void)
 	thread_t thread;
 
 	if (kernel_thread_start(apollo_touch_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo touch");
 		thread_deallocate(thread);
 	}
 }

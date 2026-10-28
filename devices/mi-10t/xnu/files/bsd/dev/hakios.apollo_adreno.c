@@ -3089,6 +3089,25 @@ apollo_gpu_last(void)
 	return gpu_fence;
 }
 
+/*
+ * The submissions given to the core and not done yet: the last one's number less the last done (the fence word the core
+ * writes). No lock, so it may be one off; for the hitch tracer (hakios.apollo_hitch.c), which calls it from a timer interrupt.
+ */
+uint32_t
+apollo_gpu_in_flight(void)
+{
+	volatile uint32_t *word;
+	int32_t ahead;
+
+	if (!gpu_kept || core_scratch.memory == 0) {
+		return 0;
+	}
+	word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+	to_memory((vm_offset_t)word, 4);
+	ahead = (int32_t)(gpu_fence - *word);
+	return ahead > 0 ? (uint32_t)ahead : 0;
+}
+
 /* the core is to write down what time it is: at one end of submission `fence` */
 static void
 ring_time(uint32_t fence, uint32_t end)
@@ -3601,6 +3620,7 @@ apollo_adreno_init(void)
 			thread_t governor;
 
 			if (kernel_thread_start(gpu_governor_thread, NULL, &governor) == KERN_SUCCESS) {
+				thread_set_thread_name(governor, "apollo gpu governor");
 				thread_deallocate(governor);
 			}
 		}

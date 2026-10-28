@@ -1,8 +1,8 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index be702e28890d..b0f46253d799 100644
+index be702e28890d..1b0b475f2963 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -125,6 +125,25 @@ bsd/dev/hakios.cpufreq.c	standard
+@@ -125,6 +125,26 @@ bsd/dev/hakios.cpufreq.c	standard
  bsd/dev/hakios.adreno.c	standard
  bsd/dev/hakios.audio.c		standard
  bsd/dev/hakios.virtio_sound.c	standard
@@ -14,6 +14,7 @@ index be702e28890d..b0f46253d799 100644
 +bsd/dev/hakios.apollo_backlight.c	standard
 +bsd/dev/hakios.apollo_display.c		standard
 +bsd/dev/hakios.apollo_frames.c		standard
++bsd/dev/hakios.apollo_hitch.c		standard
 +bsd/dev/hakios.apollo_adreno.c		standard
 +bsd/dev/hakios.apollo_adsp.c		standard
 +bsd/dev/hakios.apollo_sound.c		standard
@@ -620,3 +621,12 @@ index 9dcd99b939e8..085c12d81bd8 100644
  		loader_return();
  	}
  	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 1b7a1fcdfcdf..2fa62f34fa0a 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -109,3 +109,4 @@
+ osfmk/arm64/user_exception_trace.c	standard
+ osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
+ osfmk/arm64/psci_smp.c	optional nos_arm_asm
++osfmk/arm64/hakios.apollo_hitch_cpu.c	optional nos_arm_asm

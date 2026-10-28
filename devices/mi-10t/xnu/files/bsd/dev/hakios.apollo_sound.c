@@ -1454,6 +1454,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 			say("apollo sound: no thread for the feeder\n");
 			goto out;
 		}
+		thread_set_thread_name(feeder, "apollo sound feeder");
 		thread_deallocate(feeder);
 		watcher_runs = true;
 		apollo_audio_set_sink("the speakers (the audio DSP, hakios.sound.c)", ios_sink);
@@ -1531,6 +1532,7 @@ apollo_sound_dsp_up(void)
 		say("apollo sound: no thread\n");
 		return;
 	}
+	thread_set_thread_name(thread, "apollo sound");
 	thread_deallocate(thread);
 }
 

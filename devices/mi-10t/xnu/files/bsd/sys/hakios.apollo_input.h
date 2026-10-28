@@ -41,6 +41,13 @@ unsigned apollo_scanout_front(void);            /* the frame the panel scans */
 #define APOLLO_FRAMES_FLIP_KINDS        9
 void apollo_frames_flip(unsigned what, uint64_t ns);
 void apollo_frames_acquire(uint64_t wait_abs, bool got);       /* the window server's apollo_scanout_acquire: its wait */
+/* apollo_hitch=1 (with apollo_frames=1): what the processors run while CoreAnimation hands over no frame (bsd/dev/hakios.apollo_hitch.c) */
+void apollo_hitch_init(void);
+void apollo_hitch_swap(uint64_t last_abs, uint64_t now_abs);    /* apollo_frames_swap: two swaps of CA's */
+void apollo_hitch_window(bool begin, uint64_t window_ns);       /* apollo_frames_shown: a 2 s window begins, or has been told */
+uint32_t apollo_gpu_in_flight(void);    /* submissions given to the GPU and not done yet; no lock (hakios.apollo_adreno.c) */
+/* a kernel thread's name (osfmk/kern/thread.c), which the hitch tracer shows for it instead of "kernel_task" */
+void thread_set_thread_name(struct thread *thread, const char *name);
 void apollo_backlight_init(void);       /* apollo_backlight=P: the panel's light, the PM8150L's WLED (bsd/dev/hakios.apollo_backlight.c) */
 void apollo_backlight_set(uint32_t fraction);   /* iOS's brightness, 0 to 0x10000 */
 void apollo_backlight_power(bool on);   /* the display switched off or on */

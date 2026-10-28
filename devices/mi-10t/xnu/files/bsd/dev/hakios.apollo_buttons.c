@@ -326,6 +326,7 @@ apollo_buttons_init(void)
 		return;
 	}
 	if (kernel_thread_start(apollo_buttons_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "apollo buttons");
 		thread_deallocate(thread);
 	}
 }
