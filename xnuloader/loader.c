@@ -254,12 +254,22 @@ clean_dcache(uint64_t start, uint64_t end)
 /* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
+static efi_block_io *find_partition(const char16 *want, unsigned want_len);
+
 static efi_block_io *
 find_log_partition(void)
 {
+	static const char16 want[] = LOG_PARTITION;
+
+	return find_partition(want, sizeof(want) / sizeof(want[0]));
+}
+
+/* the GPT partition of that name (want_len: its char16s with the terminating 0) */
+static efi_block_io *
+find_partition(const char16 *want, unsigned want_len)
+{
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
-	static const char16 want[] = LOG_PARTITION;
 	efi_handle *handles;
 	uint64_t count;
 
@@ -274,7 +284,7 @@ find_log_partition(void)
 		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
 			continue;
 		}
-		for (unsigned k = 0; k < sizeof(want) / sizeof(want[0]); k++) {
+		for (unsigned k = 0; k < want_len; k++) {
 			if (info->name[k] != want[k]) {
 				match = 0;
 				break;
@@ -326,6 +336,26 @@ static int hc_list_is_uefis(void);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
+
+/* what is staged (compose_live_log's log of a kernel still running) into logdump as it is, quietly */
+static void
+write_staged(void)
+{
+	efi_block_io *bio = find_log_partition();
+	uint64_t bs, len;
+
+	if (bio == NULL || !hc_list_is_uefis()) {
+		return;
+	}
+	bs = bio->media->block_size;
+	len = (staged_len + 1 + bs - 1) / bs * bs;
+	if (staged_data != out_buf || len > sizeof(out_buf)) {
+		return;
+	}
+	if (!EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf))) {
+		bio->flush_blocks(bio);
+	}
+}
 
 static void
 write_logs(const char *klog, uint64_t klog_len)
@@ -425,16 +455,25 @@ dt_prop_u64(struct dt_writer *w, const char *name, uint64_t value)
 	dt_prop(w, name, &value, sizeof(value));
 }
 
+static uint64_t firmware_seconds(int any_year);
+
 /* Seconds since 1970 by the firmware's real-time clock, or 0 when it has none or it is not set. */
 static uint64_t
 firmware_epoch(void)
+{
+	return firmware_seconds(0);
+}
+
+/* the same, any_year: also a clock that was never set (the Mi 10T's PMIC counts from 1970: Android keeps the offset) */
+static uint64_t
+firmware_seconds(int any_year)
 {
 	static const uint16_t before_month[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
 	struct efi_time t;
 	uint64_t days;
 
 	if (ST->rt == NULL || ST->rt->get_time == NULL || EFI_ERROR(ST->rt->get_time(&t, NULL)) ||
-	    t.year < 2024 || t.year > 2099 || t.month < 1 || t.month > 12) {
+	    (!any_year && t.year < 2024) || t.year < 1970 || t.year > 2099 || t.month < 1 || t.month > 12) {
 		return 0;
 	}
 	days = (uint64_t)(t.year - 1970) * 365 + (t.year - 1969) / 4 + before_month[t.month - 1] + (t.day - 1);
@@ -2342,7 +2381,7 @@ static int64_t
 run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
     uint64_t budget)
 {
-	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0, last_log_save;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
@@ -2364,7 +2403,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	/* the last argument arrives in that core's x0 */
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
-	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+	started = last_pet = last_battery = last_beat_at = last_log_save = READ_SYSREG(CNTVCT_EL0);
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
 	if (PLAT->log_other_cpu) {
 		flush_log();
@@ -2438,6 +2477,12 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		}
 		if (block_enabled) {
 			block_poll();
+		}
+		/* the Mi 10T: the log as it stands into logdump every 30 s (a hang, a forced restart: Android reads it there) */
+		if (PLAT == &platform_apollo && arrived && live != NULL && seconds_since(last_log_save) >= 30) {
+			last_log_save = READ_SYSREG(CNTVCT_EL0);
+			compose_live_log(live, slide);
+			write_staged();
 		}
 		usb_poll_command();
 		if (block_enabled) {
@@ -2622,6 +2667,8 @@ struct payload_info {
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	const uint8_t *resident;        /* a resident image carried in the payload itself (the Mi 10T's recovery image) */
+	uint32_t resident_size;
 	int usb_mode;
 };
 
@@ -2669,6 +2716,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->cmdline = text;
 		} else if (str_eq(e->name, "physbase")) {
 			pi->forced_base = parse_number(text, 16); /* testing aid; must be free RAM */
+		} else if (str_eq(e->name, "resident")) {
+			pi->resident = p + sizeof(*e);            /* copied to the resident address by run_kernel */
+			pi->resident_size = e->size;
 		} else if (str_eq(e->name, "rdres")) {
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
 		} else if (str_eq(e->name, "checkpoint")) {
@@ -2739,6 +2789,7 @@ static struct {
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
+static int run_from_phone;          /* started by the Mi 10T's boot menu, no PC: the kernel runs until it stops */
 
 static void
 set_result(const char *what, uint64_t a, uint64_t b)
@@ -2851,6 +2902,51 @@ choose_window(const struct payload_info *pi)
  */
 static int starts_with(const char *s, const char *prefix);
 
+/*
+ * The Mi 10T's time for a run from the phone. Its clock (the PMIC's) was never set -- Android keeps an offset to it
+ * on its own encrypted partition --, so this keeps one too, in the last block of logdump: a run with epoch= (from a
+ * PC, xl) stores epoch less the clock; a run without one gets the clock plus that, as epoch=. Returns what to add to
+ * the command line: 0 when it has epoch= already or nothing is known.
+ */
+static uint64_t
+apollo_time(const char *cmdline)
+{
+	efi_block_io *bio = find_log_partition();
+	uint64_t clock = firmware_seconds(1), given = 0, bs, last;
+	int64_t *rec;
+
+	for (const char *c = cmdline; *c; c++) {
+		if (starts_with(c, "epoch=") && (c == cmdline || c[-1] == ' ')) {
+			given = parse_number(c + 6, 10);
+		}
+	}
+	if (bio == NULL || clock == 0 || !hc_list_is_uefis()) {
+		return 0;
+	}
+	bs = bio->media->block_size;
+	last = bio->media->last_block;
+	if (bs < 16 || bs > sizeof(block_buffer) || EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, last, bs, block_buffer))) {
+		return 0;
+	}
+	rec = (int64_t *)(void *)block_buffer;
+	if (given != 0) {
+		memset(block_buffer, 0, bs);
+		memcpy(block_buffer, "HAKITIME", 8);
+		rec[1] = (int64_t)given - (int64_t)clock;
+		if (!EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, last, bs, block_buffer))) {
+			bio->flush_blocks(bio);
+		}
+		print("time: %d s from the PC, the clock says %d: offset kept\n", given, clock);
+		return 0;
+	}
+	if (memcmp(block_buffer, "HAKITIME", 8) != 0) {
+		print("time: no offset kept (no run from a PC yet): the clock as it is\n");
+		return 0;
+	}
+	print("time: the clock %d plus the kept offset %d\n", clock, (uint64_t)rec[1]);
+	return (uint64_t)((int64_t)clock + rec[1]);
+}
+
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -2914,6 +3010,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
+	}
+	/* a resident image that came in the payload: where `oem ramdisk` would have put it (no PC needed) */
+	if (pi.resident != NULL && pi.resident_size != 0) {
+		uint8_t *res = (uint8_t *)(uintptr_t)(phys_base + RESIDENT_RD_OFFSET);
+		uint64_t res_size = ((uint64_t)pi.resident_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+
+		memcpy(res, pi.resident, pi.resident_size);
+		memset(res + pi.resident_size, 0, res_size - pi.resident_size);
+		resident_rd_size = pi.resident_size;
 	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
@@ -3045,6 +3150,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			break;
 		}
 	}
+	if (run_from_phone && kernel_budget == 0) {
+		kernel_budget = 1ULL << 40;     /* (the watchdog is fed for as long as it runs) */
+	}
 
 	/* Give the kernel the address of our return stub and the checkpoint to stop at. */
 	for (uint64_t *q = (uint64_t *)kern_lo; q < (uint64_t *)kern_hi; q++) {
@@ -3160,6 +3268,27 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
+	}
+	if (PLAT == &platform_apollo) {
+		/* the time: a PC's run brings it (epoch=), and leaves its offset to the clock for a run from the phone */
+		uint64_t epoch = apollo_time(pi.cmdline);
+
+		if (epoch != 0 && n < BOOT_LINE_LENGTH - 24) {
+			char digits[24];
+			int k = 0;
+
+			ba->commandLine[n++] = ' ';
+			for (const char *c = "epoch="; *c; c++) {
+				ba->commandLine[n++] = *c;
+			}
+			do {
+				digits[k++] = (char)('0' + epoch % 10);
+				epoch /= 10;
+			} while (epoch != 0);
+			while (k > 0) {
+				ba->commandLine[n++] = digits[--k];
+			}
+		}
 	}
 
 	/* --- device tree ---------------------------------------------------- */
@@ -3560,6 +3689,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 #define USB_EP_OUT   0x01
 #define USB_EP_IN    0x81
 #define USB_CHUNK    (1024 * 1024)
+#define USB_RX_PIECE (64 * 1024)
 
 static usb_device_protocol *USB;
 static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download that follows */
@@ -3679,6 +3809,7 @@ usb_start(void)
 #define USB_XFER_LIMIT_S        10
 static int usb_wait_limited;    /* set by usb_rx_data() and usb_tx() for the one wait they make */
 static uint32_t usb_aborts;
+static uint32_t usb_stale_cancels;    /* notices of cancelled transfers passed over by usb_wait */
 
 static int64_t
 usb_wait(uint8_t endpoint)
@@ -3712,6 +3843,15 @@ usb_wait(uint8_t endpoint)
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
+			/*
+			 * A cancelled transfer's notice is the one aborted before (here, at the limit above, or by usb_rx_drop),
+			 * arriving late: not this transfer's end. Taken as it, the wait returned at once while this transfer
+			 * stayed queued, and its reply went out a command late -- every reply after it too.
+			 */
+			if (data.transfer.status == UsbDeviceTransferStatusCancelled) {
+				usb_stale_cancels++;
+				continue;
+			}
 			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
 		}
 		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
@@ -3721,7 +3861,23 @@ usb_wait(uint8_t endpoint)
 	}
 }
 
+static int usb_is_command(const char *cmd);
+static unsigned usb_strays;     /* data that came as a command and was not one (usb_command_loop) */
 static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
+
+/*
+ * The connection changed (the PC enumerated the phone again, as it does right after the bootloader hands over): a
+ * receive left with the controller is taken back, not just forgotten. Forgotten, it could stay queued beside the
+ * next one, and every command after landed in the slot of the one before: replies one command late, uploads stuck.
+ */
+static void
+usb_rx_drop(void)
+{
+	if (usb_rx_queued && USB->abort_xfer != NULL) {
+		USB->abort_xfer(USB_EP_OUT);
+	}
+	usb_rx_queued = 0;
+}
 
 static int64_t
 usb_rx(uint8_t *buf, uint64_t len)
@@ -3867,7 +4023,8 @@ fb_command(char *cmd)
 			}
 			fb_reply_data(total);
 			while (got < total) {
-				uint64_t want = total - got > USB_CHUNK ? USB_CHUNK : total - got;
+				/* 64 KB at a time: the phone's USB driver stalled now and then inside 1 MB receives */
+				uint64_t want = total - got > USB_RX_PIECE ? USB_RX_PIECE : total - got;
 				int64_t r = usb_rx_data(usb_rx_buf, want);
 				if (r <= 0) {
 					print("usb: download: %d of %d bytes, then the transfer failed\n", got, total);
@@ -3944,6 +4101,17 @@ fb_command(char *cmd)
 				set_result("not-started", 0, 0);
 				compose_logs(NULL, 0);
 			}
+		} else if (starts_with(cmd, "oem time ") && PLAT == &platform_apollo) {
+			/* "oem time SECONDS": the PC's time, kept as an offset to the clock for runs from the phone (apollo_time) */
+			char line[40] = "epoch=";
+			unsigned k = 6;
+
+			for (const char *c = cmd + 9; *c >= '0' && *c <= '9' && k < sizeof(line) - 1; c++) {
+				line[k++] = *c;
+			}
+			line[k] = 0;
+			apollo_time(line);
+			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem hang")) {
 			fb_reply("OKAY", "watchdog test: not petting any more");
 			for (;;) {
@@ -3991,7 +4159,7 @@ usb_poll_command(void)
 	USB->handle_event(&msg, &size, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
-		usb_rx_queued = 0;
+		usb_rx_drop();
 		return;
 	}
 	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) {
@@ -4004,7 +4172,34 @@ usb_poll_command(void)
 	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
 	memcpy(cmd, usb_rx_buf, (size_t)n);
 	cmd[n] = 0;
+	if (!usb_is_command(cmd)) {
+		return;         /* (see usb_is_command) */
+	}
 	fb_command(cmd);
+}
+
+/*
+ * A fastboot command, or not: stray data -- left in the controller by the bootloader (menu.c), or the rest of an
+ * upload the loader gave up on -- is not answered. Answering it put every later
+ * reply one command behind (getvar product came back empty, then a download failed).
+ */
+static int
+usb_is_command(const char *cmd)
+{
+	static const char *const known[] = { "getvar:", "download:", "upload", "oem ", "reboot", "boot", "continue", "flash:",
+		"erase:", "set_active:" };
+
+	for (const char *c = cmd; *c != 0; c++) {
+		if (*c < 0x20 || *c >= 0x7f) {
+			return 0;
+		}
+	}
+	for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+		if (starts_with(cmd, known[i])) {
+			return 1;
+		}
+	}
+	return 0;
 }
 
 static void
@@ -4028,6 +4223,12 @@ usb_command_loop(void)
 		}
 		memcpy(cmd, usb_rx_buf, (size_t)n);
 		cmd[n] = 0;
+		if (!usb_is_command(cmd)) {
+			if (usb_strays++ < 4) {
+				print("usb: %d bytes that are not a command: not answered\n", n);
+			}
+			continue;
+		}
 		fb_command(cmd);
 	}
 }
@@ -4114,6 +4315,74 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+/*
+ * The Mi 10T's boot control (the "misc" partition: Android's bootloader_message, its first 32 bytes
+ * the command). With "boot-recovery" there the phone's bootloader starts recovery -- this loader --
+ * instead of Android, at every start until it is cleared: `fastboot reboot recovery` leaves it so.
+ * set 1: write it (a restart from iOS comes back to iOS); set 0: clear it if it is there (at every
+ * start of the loader, so that the next plain restart is Android's).
+ */
+static void
+apollo_bcb(int set)
+{
+	static const char16 want[] = u"misc";
+	static const char cmd[] = "boot-recovery";
+	efi_block_io *bio = find_partition(want, sizeof(want) / sizeof(want[0]));
+	uint64_t bs;
+	int there;
+
+	if (bio == NULL || !hc_list_is_uefis()) {
+		print("misc: %s\n", bio == NULL ? "no partition" : "not now (UEFI's transfer list is not in)");
+		return;
+	}
+	bs = bio->media->block_size;
+	if (bs > sizeof(block_buffer) || EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, bs, block_buffer))) {
+		print("misc: not read\n");
+		return;
+	}
+	there = memcmp(block_buffer, cmd, sizeof(cmd)) == 0;
+	if (set == there) {
+		return;
+	}
+	memset(block_buffer, 0, 32);
+	if (set) {
+		memcpy(block_buffer, cmd, sizeof(cmd));
+	}
+	if (EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, 0, bs, block_buffer))) {
+		print("misc: NOT written\n");
+		return;
+	}
+	bio->flush_blocks(bio);
+	print("misc: boot-recovery %s\n", set ? "set" : "cleared");
+}
+
+/*
+ * Why a kernel started from the phone came back, from its last words (halt_all_cpus() prints one of
+ * these before loader_return(): no driver here powers the phone off or restarts it): 'h' power off,
+ * 'r' restart, 0 anything else (a panic, a hang).
+ */
+static int
+apollo_end_of(const char *klog, uint64_t len)
+{
+	static const char halted[] = "CPU halted", reboot[] = "MACH Reboot";
+	uint64_t from = len > 65536 ? len - 65536 : 0;
+	int what = 0;
+
+	if (klog == NULL || len > (64u << 20)) {
+		return 0;
+	}
+	for (uint64_t i = from; i < len; i++) {
+		if (i + sizeof(halted) - 1 <= len && memcmp(klog + i, halted, sizeof(halted) - 1) == 0) {
+			what = 'h';
+		} else if (i + sizeof(reboot) - 1 <= len && memcmp(klog + i, reboot, sizeof(reboot) - 1) == 0) {
+			what = 'r';
+		} else if (klog[i] == 'p' && i + 6 <= len && memcmp(klog + i, "panic(", 6) == 0) {
+			what = 0;       /* a panic after it: not an orderly end */
+		}
+	}
+	return what;
+}
+
 /* the boot menu of the Mi 10T (apollo only: see menu_run()) */
 #include "menu.c"
 
@@ -4157,6 +4426,9 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
+	if (PLAT == &platform_apollo) {
+		apollo_bcb(0);          /* started: the next plain restart is Android's again */
+	}
 	if (have_payload && pi.usb_mode) {
 		int usb_ok = usb_start();
 
@@ -4164,8 +4436,29 @@ efi_main(efi_handle image, efi_system_table *st)
 			flush_log();
 		}
 		/* the Mi 10T, started from its recovery partition: the boot menu (menu.c), unless a host is there */
-		if (PLAT == &platform_apollo) {
-			menu_run(usb_ok);
+		if (PLAT == &platform_apollo && menu_run(usb_ok, pi.kernel != NULL)) {
+			/* iOS from the phone: as "oem run", with the kernel the image carries; a PC can still ask for the log */
+			set_result("running", 0, 0);
+			run_from_phone = 1;
+			print("== XNULOADER run (from the phone) ==\n");
+			if (!run_kernel(0, 0)) {
+				set_result("not-started", 0, 0);
+				compose_logs(NULL, 0);
+			} else {
+				/* power off and restart from iOS (the log is in logdump already): off, or back to iOS */
+				int end = apollo_end_of((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+
+				if (end == 'h') {
+					print("iOS powered off: off\n");
+					hc_take_back("before power off");
+					ST->rt->reset_system(2 /* EfiResetShutdown */, 0, 0, NULL);
+				} else if (end == 'r') {
+					print("iOS restarted: back to iOS\n");
+					hc_take_back("before restart");
+					apollo_bcb(1);
+					ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+				}
+			}
 		}
 		if (usb_ok) {
 			usb_command_loop();

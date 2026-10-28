@@ -5,7 +5,10 @@
  * with nobody at a PC. menu_run() then shows a full-screen menu drawn here (no artwork of anyone's:
  * a ring with a dot, drawn procedurally, and the word "HakiOS" in Montserrat, see menu_font.h):
  *
- *   iOS          the loader's USB command loop, waiting for xl on a PC (what it always did)
+ *   iOS          with a kernel in the image (devices/mi-10t/tools/mk-recovery.sh): iOS from the phone,
+ *                the kernel and its boot images taken from the image, the system from `darwin`; the
+ *                default after MENU_IOS_MS. Without one: the loader's USB command loop, waiting for
+ *                xl on a PC (what it always did)
  *   Android      a cold reset: with no key held the phone boots Android
  *   Boot log     the loader's log, full screen; any key returns
  *   Power off    EfiResetShutdown
@@ -17,7 +20,8 @@
  * The PC keeps priority, so that xl works unattended:
  *   - for MENU_GRACE_MS after usb_start nothing is drawn; a host that is there already (the cable
  *     state becomes "connected", or a command arrives) means the loader was started by `fastboot
- *     boot` (xl enter) or is wanted by a PC: no menu at all, the command loop as before;
+ *     boot` (xl enter) or is wanted by a PC: no menu at all, the command loop as before (with a
+ *     kernel in the image only a command counts: a PC's cable alone, charging, still shows the menu);
  *   - while the menu shows, USB is serviced as usb_poll_command() does: the first command a host
  *     sends ends the menu and is handled (nothing is lost), the command loop takes over;
  *   - a host that connects while the menu shows makes iOS the default, chosen after
@@ -48,6 +52,7 @@ struct menu_font {
 #define MENU_GRACE_MS   2000    /* before the menu: is a host there already? */
 #define MENU_IDLE_MS    30000   /* no key for this long: Android */
 #define MENU_HOST_MS    5000    /* a host connected meanwhile, no key yet: iOS */
+#define MENU_IOS_MS     8000    /* a kernel in the image, no key: iOS from the phone */
 #define MENU_KEYS_LOGGED 24
 
 #define RGB(r, g, b)    (((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
@@ -90,6 +95,7 @@ static struct {
 	uint32_t *px;           /* the canvas, 0x00RRGGBB = the GOP's BGRA in memory */
 	int w, h;
 	int usb_ok;
+	int have_kernel;        /* the image carries a kernel: iOS starts from the phone */
 	int sel;
 	int keys;               /* keys read so far */
 	int key_pressed;        /* since the menu showed */
@@ -413,7 +419,7 @@ menu_card(int slot, int item, int selected, const char *sub)
 {
 	int y0 = CARD_Y + slot * (CARD_H + CARD_GAP), y1 = y0 + CARD_H;
 	int cx = CARD_X0 + 40 + 52, cy = y0 + CARD_H / 2;
-	int disabled = item == M_IOS && !M.usb_ok;
+	int disabled = item == M_IOS && !M.usb_ok && !M.have_kernel;
 	char letter[2] = { menu_title[item][0], 0 };
 	const struct menu_glyph *g = menu_glyph(&menu_font_body, letter[0]);
 
@@ -437,7 +443,9 @@ menu_cards(void)
 	for (int i = 0; i < M_COUNT; i++) {
 		const char *sub = menu_sub[i];
 
-		if (i == M_IOS && !M.usb_ok) {
+		if (i == M_IOS && M.have_kernel) {
+			sub = "Start iOS from this phone";
+		} else if (i == M_IOS && !M.usb_ok) {
 			sub = "USB is not available";
 		}
 		if (i == M.sel && M.note != NULL) {
@@ -592,7 +600,7 @@ menu_usb_poll(char *cmd, uint64_t size)
 	USB->handle_event(&msg, &len, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
-		usb_rx_queued = 0;
+		usb_rx_drop();
 		print("menu: USB %s\n", usb_connected ? "connected" : "disconnected");
 		return 0;
 	}
@@ -739,35 +747,65 @@ menu_free(void)
 }
 
 /*
- * Returns when the command loop is to take over: iOS was chosen, or a host is there (its first
- * command, if one came, already handled). Does not return for Android and power off.
+ * Returns 1 when iOS is to start from the image's kernel (have_kernel), 0 when the command loop is to
+ * take over: iOS was chosen without a kernel, or a host is there (its first command, if one came,
+ * already handled). Does not return for Android and power off.
  */
+/* what came over USB, printable (stray data is not text) */
 static void
-menu_run(int usb_ok)
+menu_print_cmd(const char *what, const char *cmd)
+{
+	char line[40];
+	int i;
+
+	for (i = 0; i < (int)sizeof(line) - 1 && cmd[i] != 0; i++) {
+		line[i] = cmd[i] >= 0x20 && cmd[i] < 0x7f ? cmd[i] : '.';
+	}
+	line[i] = 0;
+	print("%s: \"%s\" (%d bytes)\n", what, line, (uint64_t)str_len(cmd));
+}
+
+static int
+menu_run(int usb_ok, int have_kernel)
 {
 	char cmd[128];
 	uint64_t start, last_key, last_tick = 0, last_batt = 0, down_first = 0, down_last = 0, host_since = 0;
 	int down_from = 0, down_fired = 0, was_connected;
 
 	if (SCREEN.base == 0 || GOP == NULL || GOP->mode == NULL || GOP->mode->info == NULL) {
-		return;
+		return have_kernel;
 	}
 	memset(&M, 0, sizeof(M));
 	M.usb_ok = usb_ok;
+	M.have_kernel = have_kernel;
 
 	/* started by `fastboot boot`, or wanted by a PC: no menu (see the top of this file) */
 	start = menu_ms();
 	while (usb_ok && menu_ms() - start < MENU_GRACE_MS) {
 		menu_pet();
 		if (menu_usb_poll(cmd, sizeof(cmd))) {
-			print("menu: a host spoke first: no menu\n");
+			menu_print_cmd("menu: a host spoke first", cmd);
+			if (!usb_is_command(cmd)) {
+				print("menu: not a command: not answered\n");
+				continue;
+			}
+			if (have_kernel) {
+				/*
+				 * Seen on the phone (28 October) with nobody at the PC, right after `fastboot boot`: data left
+				 * in the controller from the bootloader's own fastboot. With a kernel in the image, the menu
+				 * shows anyway and a real host's next command ends it.
+				 */
+				print("menu: not taken (a kernel in the image): the menu\n");
+				break;
+			}
+			print("menu: no menu\n");
 			screen_quiet = 1;
 			fb_command(cmd);
-			return;
+			return 0;
 		}
-		if (usb_connected) {
+		if (usb_connected && !have_kernel) {
 			print("menu: a host is connected: no menu\n");
-			return;
+			return 0;
 		}
 		BS->stall(2000);
 	}
@@ -777,7 +815,7 @@ menu_run(int usb_ok)
 	if (EFI_ERROR(BS->allocate_pool(EfiLoaderData, (uint64_t)M.w * M.h * 4, (void **)&M.px)) || M.px == NULL) {
 		print("menu: no memory for the canvas\n");
 		M.px = NULL;
-		return;
+		return have_kernel;
 	}
 	print("menu: shown (%d x %d, Blt %s)\n", (uint64_t)M.w, (uint64_t)M.h, GOP->blt != NULL ? "yes" : "no");
 	screen_quiet = 1;               /* the console is not to write over the menu */
@@ -794,20 +832,20 @@ menu_run(int usb_ok)
 	M.sel = M_IOS;
 	last_key = menu_ms();
 	was_connected = usb_connected;
-	menu_draw_all(M_ANDROID, MENU_IDLE_MS);
+	menu_draw_all(have_kernel ? M_IOS : M_ANDROID, have_kernel ? MENU_IOS_MS : MENU_IDLE_MS);
 
 	for (;;) {
 		uint64_t now = menu_ms(), left;
 		int item = -1, k, deflt;
 
 		menu_pet();
-		if (menu_usb_poll(cmd, sizeof(cmd))) {
+		if (menu_usb_poll(cmd, sizeof(cmd)) && usb_is_command(cmd)) {
 			print("menu: a host spoke: iOS\n");
 			menu_farewell(M_IOS, "A PC is talking to the phone");
 			menu_free();
 			screen_quiet = 1;
 			fb_command(cmd);
-			return;
+			return 0;
 		}
 		if (usb_connected != was_connected) {
 			was_connected = usb_connected;
@@ -820,7 +858,10 @@ menu_run(int usb_ok)
 		}
 
 		/* the default, and how long until it is taken */
-		if (host_since != 0 && !M.key_pressed) {
+		if (have_kernel && !M.key_pressed) {
+			deflt = M_IOS;
+			left = now - last_key >= MENU_IOS_MS ? 0 : MENU_IOS_MS - (now - last_key);
+		} else if (host_since != 0 && !M.key_pressed) {
 			deflt = M_IOS;
 			left = now - host_since >= MENU_HOST_MS ? 0 : MENU_HOST_MS - (now - host_since);
 		} else {
@@ -863,7 +904,12 @@ menu_run(int usb_ok)
 			item = M.sel;
 		}
 
-		if (item == M_IOS) {
+		if (item == M_IOS && M.have_kernel) {
+			print("menu: iOS from the phone\n");
+			menu_farewell(M_IOS, "Starting iOS...");
+			menu_free();
+			return 1;
+		} else if (item == M_IOS) {
 			if (!M.usb_ok) {
 				M.note = "USB is not available: choose another";
 				menu_draw_cards();
@@ -871,7 +917,7 @@ menu_run(int usb_ok)
 				print("menu: iOS\n");
 				menu_farewell(M_IOS, usb_connected ? "Connected: run xl on the PC" : "Waiting for a PC: run xl there");
 				menu_free();
-				return;
+				return 0;
 			}
 		} else if (item == M_ANDROID) {
 			print("menu: Android\n");
@@ -891,7 +937,7 @@ menu_run(int usb_ok)
 				menu_free();
 				screen_quiet = 1;
 				fb_command(cmd);
-				return;
+				return 0;
 			}
 			last_key = menu_ms();
 			menu_draw_all(M_ANDROID, MENU_IDLE_MS);
