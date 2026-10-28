@@ -838,6 +838,43 @@ index 88adf2dda936..e29e09fc0f0b 100644
  	/*
  	 * We first evaluate policies that may deny the granting of
  	 * privilege unilaterally.
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index 20d9d475e0b9..d14d3607fb53 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -173,6 +173,24 @@ extern int vm_swapfile_create_thread_running;
+ extern int vm_swapfile_gc_thread_running;
+ extern uint32_t cl_sparse_push_error;
+ 
++/* hakios: a line into the loader's log as well (printf alone reaches only the message buffer): the loader of the
++ * Mi 10T reads the last of these to tell a power off from a restart (xnuloader/loader.c, apollo_end_of) */
++extern void loader_log_putc(char c);
++static void __printflike(1, 2)
++hakios_say(const char *format, ...)
++{
++	char line[200];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++}
++
+ int
+ reboot_kernel(int howto, char *message)
+ {
+@@ -338,6 +356,7 @@ force_reboot:
+ 		hostboot_option = HOST_REBOOT_UPSDELAY;
+ 	}
+ 
++	hakios_say("\nshutdown: host_reboot: %s\n", (howto & RB_HALT) ? "halt" : "restart");
+ 	host_reboot(host_priv_self(), hostboot_option);
+ 	/*
+ 	 * should not be reached
 diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 index ae4a5f33df1e..986b517dfd18 100644
 --- a/bsd/kern/kern_sig.c
